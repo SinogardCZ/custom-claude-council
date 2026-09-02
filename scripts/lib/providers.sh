@@ -311,6 +311,11 @@ get_model() {
         antigravity) cli_model antigravity "${ANTIGRAVITY_MODEL:-}" ;;
         kimi)       echo "${KIMI_MODEL:-kimi-k3}" ;;
         kimi-cli)   cli_model kimi-cli "${KIMI_CLI_MODEL:-}" ;;
+        # The date suffix is load-bearing: bare deepseek-ai/deepseek-v4-pro is a
+        # 404, and most reports of a "blocked" NVIDIA account are that instead.
+        # Verified live against a build.nvidia.com key: this id and
+        # moonshotai/kimi-k3 answer, deepseek-v4-flash-0731 never does.
+        nvidia)     echo "${NVIDIA_MODEL:-deepseek-ai/deepseek-v4-pro-0813}" ;;
         ollama)     echo "${OLLAMA_MODEL:-local}" ;;
         # Pinned rather than an alias for the reason stated above, and pinned to
         # an Anthropic id because that is the one vendor the council otherwise
@@ -409,6 +414,9 @@ provider_color() {
         grok|grok-cli)     echo -e "${RED:-}" ;;
         perplexity)        echo -e "${GREEN:-}" ;;
         kimi|kimi-cli)     echo -e "${BRIGHT_BLACK:-}" ;;
+        # Shares GREEN with perplexity: the eight-colour palette is spent, and
+        # the swatch below is what actually tells the two apart on screen.
+        nvidia)            echo -e "${GREEN:-}" ;;
         ollama)            echo -e "${CYAN:-}" ;;
         openrouter|openrouter-[0-9]*) echo -e "${MAGENTA:-}" ;;
         *)                 echo -e "${CYAN:-}" ;;
@@ -428,6 +436,7 @@ provider_color_rgb() {
         grok|grok-cli)     printf -v "$__out" '239;68;68'    ;;  # red-500
         perplexity)        printf -v "$__out" '22;163;74'    ;;  # green-600
         kimi|kimi-cli)     printf -v "$__out" '63;63;70'     ;;  # zinc-700
+        nvidia)            printf -v "$__out" '118;185;0'    ;;  # NVIDIA green
         ollama)            printf -v "$__out" '8;145;178'    ;;  # cyan-600
         openrouter|openrouter-[0-9]*) printf -v "$__out" '124;58;237' ;;  # violet-600
         *)                 printf -v "$__out" '113;113;122'  ;;  # zinc-500
