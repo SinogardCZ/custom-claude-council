@@ -4,6 +4,30 @@ All notable changes to claude-council are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to a `YYYY.M.BUILD` versioning scheme where `BUILD` resets each month.
 
+## Unreleased
+
+### Features
+
+- **`bump_for_reasoning` takes an optional `--ceiling`.** The helper is written
+  as a *raise*: it multiplies the base cap by eight and never returns less than
+  32768. For an API whose own limit sits below that floor, the raise is a
+  refusal — NVIDIA NIM documents `max_tokens` as 1..16384 for
+  `deepseek-v4-pro-0813` and rejects anything higher, so an unbounded bump turns
+  every call into a 400. `--ceiling N` bounds the result instead of skipping the
+  bump, so a reasoning model on such an endpoint keeps all the headroom the API
+  will actually give it.
+
+  The clamp runs last, after the floor. Applied before it, the floor would raise
+  the value straight back over the API's limit — the bug the ceiling exists to
+  prevent. It runs on both paths, matched pattern or not: a caller that raised
+  `COUNCIL_MAX_TOKENS` above the ceiling would otherwise slip past unbounded on
+  the no-match path.
+
+  It is an option prefix rather than a fifth positional argument because the
+  pattern list is variadic — anything appended to the end would be read as a
+  pattern. Callers that pass no `--ceiling` are unaffected, and all six existing
+  ones are unchanged.
+
 ## 2026.9.2
 
 ### Fixes
