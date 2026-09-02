@@ -23,6 +23,7 @@ WHITE='\033[37m'
 RED='\033[31m'
 GREEN='\033[32m'
 MAGENTA='\033[35m'
+BRIGHT_BLACK='\033[90m'
 CYAN='\033[36m'
 DIM='\033[2m'
 RESET='\033[0m'
@@ -128,6 +129,17 @@ check_provider() {
                 "https://api.moonshot.ai/v1/models" 2>/dev/null || true)
             rm -f "$cfg"
             ;;
+        openrouter)
+            # Not /api/v1/models: that answers 200 with no key at all and with a
+            # rejected one, so the openai-shaped probe would report a dead seat
+            # as Connected. /api/v1/key is the endpoint that actually authenticates,
+            # answering 401 for both an absent and an invalid key.
+            cfg=$(curl_secret_config "Authorization: Bearer ${api_key}")
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+                --config "$cfg" \
+                "https://openrouter.ai/api/v1/key" 2>/dev/null || true)
+            rm -f "$cfg"
+            ;;
         perplexity)
             # Perplexity has no /models endpoint, so auth can only be probed with
             # a (billable) chat request. The API rejects anything under 16 output
@@ -227,6 +239,9 @@ remediation_for() {
         grok:no_key)          echo "export XAI_API_KEY=<key>" ;;
         perplexity:no_key)    echo "export PERPLEXITY_API_KEY=<key>" ;;
         kimi:no_key)          echo "export KIMI_API_KEY=<key>" ;;
+        # A roster names every row openrouter-N, and one key serves all of them,
+        # so the hint must not vanish exactly when the feature is configured.
+        openrouter:no_key|openrouter-*:no_key) echo "export OPENROUTER_API_KEY=<key>" ;;
         codex:no_binary)      echo "npm install -g @openai/codex" ;;
         codex:unauthed)       echo "codex login" ;;
         antigravity:no_binary) echo "install the Antigravity CLI (agy)" ;;
@@ -254,6 +269,14 @@ openai_status=$(check_provider "openai" "OPENAI_API_KEY" "$(get_model openai)")
 grok_status=$(check_provider "grok" "GROK_API_KEY" "$(get_model grok)")
 perplexity_status=$(check_provider "perplexity" "PERPLEXITY_API_KEY" "$(get_model perplexity)")
 kimi_status=$(check_provider "kimi" "KIMI_API_KEY" "$(get_model kimi)")
+openrouter_status=$(check_provider "openrouter" "OPENROUTER_API_KEY" "$(get_model openrouter)")
+# The measured round-trip, kept so a roster can stamp it onto every seat's row
+# without probing again. Empty unless the probe succeeded.
+openrouter_probe_ms=""
+if [[ "$openrouter_status" == ok:* ]]; then
+    openrouter_probe_ms="${openrouter_status#ok:}"
+    openrouter_probe_ms="${openrouter_probe_ms%%:*}"
+fi
 # codex login status exits non-zero when logged out; agy has no
 # equivalent offline auth probe, so it stays a single-tier check. `grok models`
 # prints "You are not authenticated." with exit 0 when logged out, which the
@@ -266,6 +289,16 @@ ollama_status=$(check_cli_provider "ollama" "ollama" list)
 
 # Format output
 # Usage: format_status <display_name> <provider_id> <status>
+# Column widths, measured in display cells. A literal tab was used here once and
+# could not work: a tab stop lands at a different place depending on how long the
+# preceding name is, so "Grok" and "Perplexity" pushed their status to different
+# columns. Padding is computed from the PLAIN text instead — the coloured strings
+# carry SGR escape bytes that occupy no width, so measuring them would pad every
+# row by a different wrong amount.
+STATUS_NAME_W=14    # fits "OpenRouter 10" and "Antigravity"
+STATUS_STATE_W=24   # fits every state but "Installed, not authenticated", which
+                    # overflows to a single space rather than widening every row
+
 format_status() {
     local name="$1"
     local provider_id="$2"
@@ -278,62 +311,104 @@ format_status() {
     # not ((n++)): under set -e a post-increment returning 0 aborts the script.
     provider_total=$((provider_total + 1))
 
-    local emoji color
-    emoji=$(provider_emoji "$provider_id")
+    local swatch color
+    swatch=$(provider_swatch "$provider_id")
     color=$(provider_color "$provider_id")
-    local status_icon status_text model_text=""
     local state="$status"
     [[ "$status" == auth_error:* ]] && state="auth_error"
     local fix
     fix=$(remediation_for "$provider_id" "$state")
-    [[ -n "$fix" ]] && fix="  ${DIM}fix: ${fix}${RESET}"
 
+    # Each column is built as a (plain, painted) pair: the plain form sets the
+    # width, the painted form is what prints. The icon is its own two-cell field
+    # so a one-glyph tick and a two-character dash still align.
+    local icon plain_state painted_state plain_detail painted_detail
     case "$status" in
         no_key)
-            status_icon="${DIM}--${RESET}"
-            status_text="${DIM}API key not set${RESET}${fix}"
+            icon="${DIM}--${RESET}"
+            plain_state="API key not set";     painted_state="${DIM}${plain_state}${RESET}"
             ;;
         no_binary)
-            status_icon="${DIM}--${RESET}"
-            status_text="${DIM}CLI not installed${RESET}${fix}"
+            icon="${DIM}--${RESET}"
+            plain_state="CLI not installed";   painted_state="${DIM}${plain_state}${RESET}"
             ;;
         unauthed)
-            status_icon="${RED}x${RESET}"
-            status_text="${RED}Installed, not authenticated${RESET}${fix}"
+            icon="${RED}✗ ${RESET}"
+            plain_state="Installed, not authenticated"; painted_state="${RED}${plain_state}${RESET}"
             ;;
         timeout)
-            status_icon="${RED}x${RESET}"
-            status_text="${RED}Connection timeout${RESET}"
+            icon="${RED}✗ ${RESET}"
+            plain_state="Connection timeout";  painted_state="${RED}${plain_state}${RESET}"
             ;;
         auth_error:*)
-            local code="${status#auth_error:}"
-            status_icon="${RED}x${RESET}"
-            status_text="${RED}Auth failed (HTTP ${code})${RESET}${fix}"
+            icon="${RED}✗ ${RESET}"
+            plain_state="Auth failed (HTTP ${status#auth_error:})"
+            painted_state="${RED}${plain_state}${RESET}"
             ;;
         error:*)
-            local code="${status#error:}"
-            status_icon="${RED}x${RESET}"
-            status_text="${RED}Error (HTTP ${code})${RESET}"
+            icon="${RED}✗ ${RESET}"
+            plain_state="Error (HTTP ${status#error:})"
+            painted_state="${RED}${plain_state}${RESET}"
             ;;
         ok:*)
             local rest="${status#ok:}"
             local duration="${rest%%:*}"
             local model="${rest#*:}"
-            status_icon="${GREEN}✓${RESET}"
-            status_text="${GREEN}Connected${RESET} ${DIM}(${duration}ms)${RESET}"
-            model_text="${DIM}${model}${RESET}"
+            icon="${GREEN}✓ ${RESET}"
+            plain_state="Connected (${duration}ms)"
+            painted_state="${GREEN}Connected${RESET} ${DIM}(${duration}ms)${RESET}"
+            plain_detail="$model"; painted_detail="${DIM}${model}${RESET}"
             ;;
     esac
 
-    echo -e "  ${emoji} ${color}${name}${RESET}\t${status_icon} ${status_text}  ${model_text}"
+    # The last column carries the model when there is one and the remediation
+    # otherwise, so a failing row still says what to do without widening every
+    # healthy row to make room for it.
+    if [[ -z "${plain_detail:-}" && -n "$fix" ]]; then
+        plain_detail="fix: ${fix}"; painted_detail="${DIM}fix: ${fix}${RESET}"
+    fi
+
+    local name_gap state_gap
+    printf -v name_gap  '%*s' "$(( STATUS_NAME_W  > ${#name}        ? STATUS_NAME_W  - ${#name}        : 1 ))" ''
+    printf -v state_gap '%*s' "$(( STATUS_STATE_W > ${#plain_state} ? STATUS_STATE_W - ${#plain_state} : 1 ))" ''
+
+    echo -e "  ${swatch}  ${color}${name}${RESET}${name_gap}${icon} ${painted_state}${state_gap}${painted_detail:-}"
 }
 
+# Both counters are initialised before the rows so the router roster, which
+# renders a variable number of rows in a loop, can count as it prints rather
+# than needing a second pass over names that are not known until runtime.
 provider_total=0
+available_count=0
 format_status "Gemini"     "gemini"     "$gemini_status"
 format_status "OpenAI"     "openai"     "$openai_status"
 format_status "Grok"       "grok"       "$grok_status"
 format_status "Perplexity" "perplexity" "$perplexity_status"
 format_status "Kimi" "kimi" "$kimi_status"
+
+# A roster (OPENROUTER_MODELS) turns the one router script into several seats.
+# They share a key, and the key is what the probe tests, so one probe result is
+# reused for every row; only the model column differs. Without a roster this
+# loop does not run and the single row below is printed instead.
+openrouter_seats=()
+openrouter_seat_models openrouter_seats
+if (( ${#openrouter_seats[@]} > 0 )); then
+    for (( seat_index = 1; seat_index <= ${#openrouter_seats[@]}; seat_index++ )); do
+        # check_provider stamps the model onto an ok: result, so the shared probe
+        # is re-stamped per seat rather than re-run. get_model, not the roster
+        # entry: an OPENROUTER_<N>_MODEL override is what the query would send,
+        # and the status check must not report a model the council would not.
+        seat_status="$openrouter_status"
+        if [[ "$openrouter_status" == ok:* ]]; then
+            seat_status="ok:${openrouter_probe_ms}:$(get_model "openrouter-${seat_index}")"
+            available_count=$((available_count + 1))
+        fi
+        format_status "OpenRouter ${seat_index}" "openrouter-${seat_index}" "$seat_status"
+    done
+else
+    format_status "OpenRouter" "openrouter" "$openrouter_status"
+    [[ "$openrouter_status" == ok:* ]] && available_count=$((available_count + 1))
+fi
 format_status "Kimi CLI" "kimi-cli" "$kimicli_status"
 format_status "Ollama" "ollama" "$ollama_status"
 format_status "Codex CLI"  "codex"      "$codex_status"
@@ -344,7 +419,7 @@ echo ""
 
 # Summary. available_count=$((...)) rather than ((available_count++)): under
 # set -e a post-increment returning 0 would abort the script on the first hit.
-available_count=0
+# The router seats already counted themselves above, where their number is known.
 [[ "$gemini_status" == ok:* ]] && available_count=$((available_count + 1))
 [[ "$openai_status" == ok:* ]] && available_count=$((available_count + 1))
 [[ "$grok_status" == ok:* ]] && available_count=$((available_count + 1))

@@ -36,11 +36,11 @@
    +--------+ +-----+ +------+ +-----+ +------+ +-----------+ +---------+
    (API)      (API)   (API)    (API)   (API)    (CLI)         (CLI)
 
-                    +----------+ +----------+ +----------+
-                    | grok-cli | | kimi-cli | |  ollama  |
-                    |   .sh    | |   .sh    | |   .sh    |
-                    +----------+ +----------+ +----------+
-                    (CLI)        (CLI)        (local)
+         +------------+ +----------+ +----------+ +----------+
+         | openrouter | | grok-cli | | kimi-cli | |  ollama  |
+         |    .sh     | |   .sh    | |   .sh    | |   .sh    |
+         +------------+ +----------+ +----------+ +----------+
+         (API, router)  (CLI)        (CLI)        (local)
         |               |               |               |
         |    +----------+----------+----------+        |
         +--->|      lib/cache.sh   |<---------+--------+
@@ -139,8 +139,22 @@ EXIT:   0 = success, non-zero = failure (error to stderr)
 
 Two flavors share the interface:
 
-- **API providers** (`gemini`, `openai`, `grok`, `perplexity`, `kimi`), gated on
-  `{PROVIDER}_API_KEY`, talk to vendor APIs over HTTPS, charge per call.
+- **API providers** (`gemini`, `openai`, `grok`, `perplexity`, `kimi`,
+  `openrouter`), gated on `{PROVIDER}_API_KEY`, talk to vendor APIs over HTTPS,
+  charge per call. `openrouter` is a router rather than a vendor: it forwards to
+  whichever upstream serves the id in `OPENROUTER_MODEL`, so its answer travels
+  one hop further than the others' and its vendor is a runtime fact, not a
+  static one. It is also the one script that can seat more than once: with
+  `OPENROUTER_MODELS` set it is discovered as `openrouter-1..N`, one seat per
+  listed model. The council's unit of identity is the seat — one header, one
+  model label, one cache key, one role — so N models is N seats rather than one
+  seat that varies. There is no `openrouter-N.sh`: `provider_script_path` routes
+  every numbered seat back to the one script, and the orchestrator exports
+  `COUNCIL_SEAT` so that script can resolve its own model instead of the
+  default. `--list-default-models` reports the default set with each name paired
+  to its model, which is the only way a caller outside the library can label a
+  numbered seat — the name alone does not say which model it carries. Without that the three seats would post one model behind three
+  headers each claiming a different one.
 - **CLI providers** (`codex`, `antigravity`, `grok-cli`, `kimi-cli`), gated on the
   binary being on `PATH`, use the user's existing CLI subscription auth, no per-call
   cost. When both an API and CLI sibling exist (codex+openai, antigravity+gemini,
@@ -167,16 +181,24 @@ temp file, and folds only its SHA-256 into the cache key (`COUNCIL_IMAGE_HASH`) 
 the bytes never enter the prompt string.
 
 Per-provider disposition when an image is attached:
-- **gemini, openai, grok, perplexity** (vision-capable) receive the image —
+- **gemini, openai, grok, perplexity, kimi** (vision-capable) receive the image —
   gemini as an `inlineData` part, openai as `input_image` (Responses API) or
   `image_url` (Chat Completions), grok and perplexity as an OpenAI-compatible
   `image_url` data-URI on their `/chat/completions` endpoint.
-- **codex, antigravity, grok-cli** (CLI, cannot accept an image) route to their
-  vision API sibling, codex→openai, antigravity→gemini, grok-cli→grok, with
-  the image. The route is taken only when the sibling is itself vision-capable,
-  so **kimi-cli** does not use it: its sibling `kimi` is text-only.
-- **kimi, kimi-cli, ollama** answer text-only, prefixed with
-  `(answered without the image)`.
+- **codex, antigravity, grok-cli, kimi-cli** (CLI, cannot accept an image) route
+  to their vision API sibling — codex→openai, antigravity→gemini, grok-cli→grok,
+  kimi-cli→kimi — with the image. The route is taken only when the sibling is
+  itself vision-capable and its key is set.
+- **openrouter** accepts an image on its curated default, which is
+  vision-capable. An `OPENROUTER_MODEL` override names one of hundreds of routed
+  models whose modalities are not knowable from here, so it is treated as
+  text-only until `OPENROUTER_VISION=1` says otherwise.
+- **kimi** reads images on its default model. `kimi.sh` has always built the
+  OpenAI-shaped `image_url` payload; only the capability table said otherwise,
+  which routed images away from a provider that could read them. `kimi-k2` and
+  its variants are text-only while `k2.5` and later are not, so a `KIMI_MODEL`
+  override opts in with `KIMI_VISION=1`.
+- **ollama** answers text-only, prefixed with `(answered without the image)`.
 
 Privacy invariant: only the image's SHA-256 keys the cache. The base64 lives
 solely in a temp file passed to providers; it is never written to cache entries
@@ -223,8 +245,11 @@ is_model_unavailable_error(body):        # retry.sh
 
 model_fallback_for(provider) -> model    # model_fallback.sh
   - one verified fallback per API provider (openai, grok, gemini, perplexity, kimi)
-  - empty for CLI providers, which degrade to their API sibling instead, and for
-    ollama, whose models are whatever is installed locally
+  - empty for CLI providers, which degrade to their API sibling instead, for
+    ollama, whose models are whatever is installed locally, and for openrouter,
+    whose fallback id is not yet verified against the live API (so its
+    wrong-model-id -> exit 3 mapping errors loudly rather than degrading; the
+    mapping is in place for the day a verified id lands)
 
 model_unavailable_cached/remember(provider, model, key_hash):
   - TTL-cached "unavailable" verdict, scoped to provider + preferred model + key
@@ -237,6 +262,46 @@ script: a preferred-model exit 3 (see Provider Scripts below), or a cached
 verdict, retries once with the fallback. The substitution is reported on the
 response header, on stderr, and folded into the synthesis prompt.
 
+### The Empty Answer (every API provider)
+
+A provider that returns no visible text is an error even when HTTP says the
+call succeeded, so every API seat guards on whitespace-stripped emptiness
+rather than `-z`: the council would otherwise cache a model that answers with
+a single space and weigh it in the synthesis like any other vote.
+
+This case never reaches the machinery above. `ensure_error_body` stamps a message
+and `.http_status` onto every body of 400 or worse, and `retry_error_body`
+covers timeout and network, so an empty answer that reaches the error branch
+with no top-level `.error` arrived as a 2xx. Three unrelated failures look
+identical there, and each seat names them from its own response shape rather
+than printing one word for all three:
+
+```
+gemini.sh:      .promptFeedback.blockReason  -> "prompt blocked (X)"
+                .candidates[0].finishReason  -> "empty response (finishReason: X,
+                                                 thoughts tokens: N/M)"
+
+openrouter.sh:  .choices[0].error            -> "provider error (502): ..."
+                                                (a mid-generation upstream
+                                                failure; OpenRouter answers 200
+                                                and puts the error on the choice)
+                .choices[0].finish_reason    -> "empty response (finish_reason: X,
+                                                 native: Y, reasoning tokens: N/M,
+                                                 reasoning chars: K)"
+```
+
+`reasoning chars` counts an answer the upstream left in `.message.reasoning`
+instead of `.content`; `finish_reason: length` with reasoning tokens near the
+completion total means the budget went to thinking. Under `COUNCIL_DEBUG`,
+`openrouter.sh` also dumps the raw body on this branch as the catch-all for a
+shape not listed here.
+
+Every `.error` read branches on `(.error | type)` before indexing. A bare-string
+`.error` (xAI at the top level, some upstreams on the choice) raises in jq
+rather than yielding null, `//` does not catch a raise, and jq's postfix `?`
+binds only to the term before it, so `.error?.message` still raises. Under
+`set -eo pipefail` that kills the script before it prints anything at all.
+
 ### Role System (`scripts/lib/roles.sh`)
 
 ```
@@ -246,6 +311,10 @@ config/roles.json defines:
 
 Role injection prepends instructions to prompt:
   "As a [ROLE], focus on [CONCERNS]..."
+
+Assignment: a bare --roles list is positional (role[i] -> provider[i] in
+discovery order); provider=role pairs bind by name. The two forms cannot mix,
+and a pair naming an absent provider, or one provider twice, is refused.
 ```
 
 ### Prompt Templates (`scripts/lib/prompts.sh`, `prompts/*.md`)
@@ -275,11 +344,13 @@ Lifecycle: queued -> running -> completed | failed | cancelled
 ### Output Contract (`schemas/`, `scripts/validate-analysis.sh`)
 
 ```
-schemas/agent-analysis.schema.json documents the deep-execution
-agent reply shape; validate-analysis.sh enforces it with jq,
-listing every violation. Invalid replies render raw under a
-visible marker - model output is never silently dropped
-(same rule as format-output.sh's render_response).
+schemas/agent-analysis.schema.json is the deep-execution analyst's
+reply contract. The workflow that runs the analysts enforces it as
+their structured output: a reply that does not match is sent back
+to the analyst, and one that never arrives is absent from the
+result, never silently dropped. validate-analysis.sh mirrors the
+schema executably with jq, listing every violation; the bats suite
+keeps the two in sync.
 ```
 
 ### Stop Gate (`hooks/hooks.json`, `scripts/stop-review-gate.sh`)
@@ -329,15 +400,16 @@ User -> Round 1 (parallel queries)
 ```
 User -> ask.md detects --agents flag (or NL trigger)
              |
-        spawn N parallel Claude subagents (background)
+        one Workflow: N analyst agents in parallel
+        (schema-enforced structured output, resumable)
              |
     +--------+--------+--------+--------+
     |        |        |        |        |
     v        v        v        v        v
- Agent:   Agent:   Agent:   Agent:   ...
+ Analyst: Analyst: Analyst: Analyst:  ...
  Gemini   OpenAI   Grok     Perplexity
     |        |        |        |
-    | Each agent independently:
+    | Each analyst independently:
     | 1. Runs provider curl script
     | 2. Evaluates response quality
     | 3. Retries with reformulated prompt if poor
@@ -360,8 +432,11 @@ User -> ask.md detects --agents flag (or NL trigger)
         save to council-cache
 ```
 
-Key difference from standard mode: subagents do meaningful analytical
-work beyond the API call, pre-digesting each response before synthesis.
+Key difference from standard mode: the analysts do meaningful analytical
+work beyond the API call, pre-digesting each response before synthesis. The
+Workflow returns validated objects, so no analysis passes through the
+orchestrator's context as text to be pasted and checked; a killed run resumes
+with the finished analysts served from cache.
 
 ### Local Council Mode (--local / no providers)
 
@@ -372,6 +447,9 @@ User -> ask.md (--local, or accepts the offer when no providers found)
         resolves that many from a diverse order (default 4, up to 8)
              |
         spawn one general-purpose subagent per role (background, blind to each other)
+        (Agent fan-out, not a Workflow: members return display-verbatim markdown
+         with nothing to enforce, and this is the no-keys path, so it keeps
+         the smaller tool requirement)
              |
     +--------+--------+--------+
     |        |        |        |
@@ -409,7 +487,7 @@ claude-council/
 │   └── plugin.json              # Plugin manifest
 ├── .github/
 │   └── workflows/
-│       └── tests.yml            # bats on ubuntu + macos; shellcheck blocks a merge
+│       └── tests.yml            # bats on ubuntu, macos and windows; shellcheck blocks a merge
 ├── agents/
 │   └── council-advisor.md       # Proactive suggestions
 ├── commands/
@@ -430,14 +508,14 @@ claude-council/
 │   ├── stop-review-gate.md      # Stop-gate reviewer contract
 │   └── kimi-cli-agent.md        # No-tools agent definition passed to the kimi CLI
 ├── schemas/
-│   └── agent-analysis.schema.json  # Deep-execution agent reply contract
+│   └── agent-analysis.schema.json  # Deep-execution analyst reply contract
 ├── scripts/
 │   ├── query-council.sh         # Main orchestrator
 │   ├── run-council.sh           # Query + format pipeline, sync and --async
 │   ├── format-output.sh         # Terminal formatter
 │   ├── check-status.sh          # Provider health check
 │   ├── stop-review-gate.sh      # Opt-in Stop hook reviewer
-│   ├── validate-analysis.sh     # Enforces the agent-analysis schema
+│   ├── validate-analysis.sh     # Executable mirror of the agent-analysis schema (test suite)
 │   ├── release.sh               # Version bump and tagging
 │   ├── dev/
 │   │   └── demo-pane.sh         # Visual test harness for the streaming pane
@@ -447,6 +525,7 @@ claude-council/
 │   │   ├── grok.sh              # API
 │   │   ├── perplexity.sh        # API
 │   │   ├── kimi.sh              # API (Moonshot)
+│   │   ├── openrouter.sh        # API (router; any model on openrouter.ai)
 │   │   ├── codex.sh             # CLI (subscription auth, shadows openai)
 │   │   ├── antigravity.sh       # CLI (subscription auth, shadows gemini)
 │   │   ├── grok-cli.sh          # CLI (subscription auth, shadows grok)
@@ -454,6 +533,7 @@ claude-council/
 │   │   └── ollama.sh            # Local (no key, no sibling)
 │   └── lib/
 │       ├── cache.sh             # Caching utilities
+│       ├── deadline.sh          # Wall-clock bound for a command (no GNU timeout on macOS or Git Bash)
 │       ├── display.sh           # Streaming tmux pane + iTerm2 lifecycle
 │       ├── export.sh            # Markdown export
 │       ├── hash.sh              # Portable SHA-256 helper (shasum / sha256sum)
@@ -474,7 +554,7 @@ claude-council/
 │   │   └── SKILL.md             # Standard query execution
 │   ├── deep-execution/
 │   │   ├── SKILL.md             # Agent-enhanced execution (--agents)
-│   │   └── agent-prompt-template.md  # Subagent prompt template
+│   │   └── agent-prompt-template.md  # Analyst prompt: query, judge, follow up, structured analysis
 │   ├── local-council-execution/
 │   │   ├── SKILL.md             # Local Claude-only council (--local / no providers)
 │   │   └── agent-prompt-template.md  # Council-member prompt template
@@ -485,12 +565,15 @@ claude-council/
 │   ├── run_tests.sh             # Test runner
 │   ├── test_helper.bash         # Shared test utilities
 │   ├── fixtures/
-│   │   └── fake-clis.bash       # Fake codex/agy/grok/kimi/ollama binaries on PATH
+│   │   ├── fake-clis.bash       # Fake codex/agy/grok/kimi/ollama binaries on PATH
+│   │   └── status-fakes.bash    # Recording curl + jq for the check-status tests
 │   ├── agent-analysis.bats
 │   ├── argmax.bats              # ARG_MAX marshalling round-trip guards
 │   ├── cache.bats
 │   ├── check-status.bats
-│   ├── cli-providers.bats       # CLI providers (codex, antigravity, grok-cli)
+│   ├── check-status-probe.bats  # The probes themselves: endpoints, --max-time, keys off the argv
+│   ├── cli-providers.bats       # CLI providers (codex, antigravity, grok-cli, kimi-cli, ollama)
+│   ├── deadline.bats            # run_with_deadline: stdin passthrough, own status, 143 at the deadline
 │   ├── display.bats
 │   ├── export.bats
 │   ├── fake-clis.bats
@@ -505,6 +588,7 @@ claude-council/
 │   ├── release.bats
 │   ├── retry.bats
 │   ├── roles.bats
+│   ├── router-seats.bats        # OPENROUTER_MODELS -> openrouter-1..N, one script, many seats
 │   ├── stop-gate.bats
 │   ├── theme.bats
 │   ├── tokens.bats
@@ -522,10 +606,12 @@ claude-council/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GEMINI_API_KEY` | - | Google AI Studio key |
+| `GEMINI_THINKING_BUDGET` | - | Cap on Gemini's internal reasoning tokens (`thinkingConfig.thinkingBudget`); unset, the model decides. Keeps room for the visible answer when reasoning would consume the whole `maxOutputTokens` and return an empty 200 |
 | `OPENAI_API_KEY` | - | OpenAI API key |
 | `XAI_API_KEY` | - | xAI API key (preferred) |
 | `GROK_API_KEY` | - | xAI API key (legacy alias; `XAI_API_KEY` wins if both set) |
 | `PERPLEXITY_API_KEY` | - | Perplexity API key |
+| `OPENROUTER_API_KEY` | - | OpenRouter API key |
 | `KIMI_API_KEY` | - | Moonshot/Kimi API key; the only var that makes `kimi` discoverable |
 | `MOONSHOT_API_KEY` | - | Read as a fallback by `kimi.sh`, but does not satisfy discovery |
 | `{PROVIDER}_MODEL` | varies | Model override (API providers) |
@@ -533,6 +619,13 @@ claude-council/
 | `ANTIGRAVITY_MODEL` | (unset) | Model passed to `agy --model`, only when set (else the model selected in the Antigravity app) |
 | `GROK_CLI_MODEL` | (unset) | Model passed to `grok -m`, only when set (else the grok CLI's own default) |
 | `KIMI_CLI_MODEL` | (unset) | Model passed to `kimi -m`, only when set (else the kimi CLI's own configured model) |
+| `OPENROUTER_MODEL` | `anthropic/claude-sonnet-5` | Any id from openrouter.ai/models (single seat) |
+| `OPENROUTER_MODELS` | (unset) | Comma-separated ids; each becomes a seat `openrouter-N`, replacing the single seat |
+| `OPENROUTER_<N>_MODEL` | (unset) | Overrides roster seat N's entry, as `<PROVIDER>_MODEL` does for any provider; the exit-3 degrade path sets it so a roster entry never resends the model that just failed |
+| `COUNCIL_SEAT` | (set by the orchestrator) | Which seat a provider script is running as; only the router reads it |
+| `OPENROUTER_VISION` | (unset) | Set to `1` to declare an `OPENROUTER_MODEL` override image-capable |
+| `KIMI_VISION` | (unset) | Set to `1` to declare a `KIMI_MODEL` override image-capable |
+| `COUNCIL_AGENT_MODEL` | `sonnet` | Model the `--agents` ANALYSTS run on (`sonnet`/`opus`/`haiku`/`fable`); not a provider model |
 | `OLLAMA_MODEL` | (unset) | Local model id; when unset, whichever model `ollama list` shows first |
 | `OLLAMA_HOST` | http://localhost:11434 | Ollama server, following Ollama's own convention |
 | `COUNCIL_PROVIDERS` | (unset) | Comma-separated roster queried by default, ahead of discovery; `--providers` still wins per call |

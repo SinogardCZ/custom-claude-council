@@ -17,9 +17,13 @@ PROMPT="${1:-}"
 IMAGE_FILE=""
 IMAGE_MIME=""
 # A large prompt (e.g. a big --file) arrives via a temp file to stay off
-# the process argv, where the OS would reject it as "argument list too long".
+# the process argv, where the OS would reject it as "argument list too long". The
+# path is kept, not just the text: jq reads the prompt with --rawfile, so it
+# stays off jq\'s argv too — bounded by the same limit.
+PROMPT_FILE=""
 if [[ "$PROMPT" == "--prompt-file" ]]; then
-    PROMPT=$(cat "${2:?--prompt-file requires a path}")
+    PROMPT_FILE="${2:?--prompt-file requires a path}"
+    PROMPT=""
     shift 2
 elif [[ $# -gt 0 ]]; then
     shift
@@ -32,7 +36,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$PROMPT" ]]; then
+if [[ -z "$PROMPT" && ! -s "$PROMPT_FILE" ]]; then
     echo "Error: No prompt provided" >&2
     exit 1
 fi
@@ -81,20 +85,32 @@ bump_for_reasoning TOKENS "$MODEL" "$BASE_TOKENS" '*r1*' '*reason*' '*gpt-oss*' 
 
 SYSTEM="${VERBOSITY_PREFIX:+$VERBOSITY_PREFIX }$BASE_SYSTEM_PROMPT"
 
+# One trap for every temp file this script owns, installed before the first of
+# them exists and naming them all: a failure between here and the request —
+# a jq that cannot read the image file, say — would otherwise leave the prompt
+# file behind, and an EXIT trap that expands a name not yet assigned ends where
+# it stands under set -u without removing anything.
+PAYLOAD_FILE="" OWNED_PROMPT_FILE=""
+trap 'rm -f "$PAYLOAD_FILE" "$OWNED_PROMPT_FILE"' EXIT
+
+stage_prompt_file
+
+# The user-message content embeds the prompt, so it reaches the payload build
+# on stdin: printf is a builtin, so neither the argv limit nor a temp file is
+# involved, where --argjson would put the whole prompt back on argv.
 if [[ -n "$IMAGE_FILE" ]]; then
-    USER_CONTENT=$(jq -n --arg prompt "$PROMPT" --rawfile b64 "$IMAGE_FILE" --arg mime "$IMAGE_MIME" '[
+    USER_CONTENT=$(jq -n --rawfile prompt "$PROMPT_FILE" --rawfile b64 "$IMAGE_FILE" --arg mime "$IMAGE_MIME" '[
         { type: "text",      text: $prompt },
         { type: "image_url", image_url: { url: ("data:" + $mime + ";base64," + $b64) } }
     ]')
 else
-    USER_CONTENT=$(jq -n --arg prompt "$PROMPT" '$prompt')
+    USER_CONTENT=$(jq -n --rawfile prompt "$PROMPT_FILE" '$prompt')
 fi
 
-PAYLOAD=$(jq -n \
+PAYLOAD=$(printf '%s' "$USER_CONTENT" | jq \
     --arg model "$MODEL" \
     --argjson tokens "$TOKENS" \
     --arg system "$SYSTEM" \
-    --argjson content "$USER_CONTENT" \
     '{
         model: $model,
         messages: [{
@@ -102,7 +118,7 @@ PAYLOAD=$(jq -n \
             content: $system
         }, {
             role: "user",
-            content: $content
+            content: .
         }],
         temperature: 0.7,
         max_tokens: $tokens
@@ -116,7 +132,6 @@ if [[ -n "$DEBUG" ]]; then
 fi
 
 PAYLOAD_FILE=$(mktemp)
-trap 'rm -f "$PAYLOAD_FILE"' EXIT
 printf '%s' "$PAYLOAD" > "$PAYLOAD_FILE"
 
 # No Authorization header: a local daemon has no key. A remote OLLAMA_HOST

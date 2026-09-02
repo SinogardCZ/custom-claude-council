@@ -21,7 +21,8 @@ on.
 /plugin install claude-council
 
 # 2. Configure at least one provider — any of these works:
-export OPENAI_API_KEY="..."         # or GEMINI_API_KEY, XAI_API_KEY, PERPLEXITY_API_KEY, KIMI_API_KEY
+export OPENAI_API_KEY="..."         # or GEMINI_API_KEY, XAI_API_KEY, PERPLEXITY_API_KEY, KIMI_API_KEY,
+                                    # OPENROUTER_API_KEY
                                     # OR install the codex / antigravity (agy) / grok / kimi CLIs (uses your
                                     # existing subscription — no API key needed)
 
@@ -69,6 +70,8 @@ Inside tmux, results stream into a side pane in real time with vendor-colored ba
 ## Features
 
 - Query Gemini, OpenAI (GPT/Codex), Grok, Perplexity, and Kimi (Moonshot AI) simultaneously
+- Seat any model OpenRouter routes to — Anthropic's Claude by default, so the council
+  hears the one vendor it otherwise has no voice for
 - Use the `codex`, `agy` (Antigravity), `grok`, and `kimi` (Kimi Code) CLIs (subscription auth) when installed — preferred over their API siblings
 - Run a local `ollama` model as a council member — no key, no subscription, no network
 - Side-by-side comparison of responses with vendor-colored headers
@@ -149,13 +152,13 @@ claude --plugin-dir /path/to/claude-council    # repo root; loaded for this sess
 | Flag | Description |
 |------|-------------|
 | `--providers=list` | Query specific providers (e.g., `gemini,openai,codex`) |
-| `--roles=list` | Assign roles (e.g., `security,performance` or preset like `balanced`) |
+| `--roles=list` | Assign roles (e.g., `security,performance`, a preset like `balanced`, or `provider=role` pairs) |
 | `--debate` | Enable two-round debate mode |
 | `--file=path` | Include specific file in context |
 | `--image=path` | Attach one image (e.g. a screenshot) for vision-capable providers |
 | `--output=path` | Export response to markdown file |
 | `--quiet` | Show only synthesis, hide individual responses |
-| `--agents` | Agent-enhanced analysis with subagents (slower, deeper) |
+| `--agents` | Agent-enhanced analysis, one Claude analyst per provider (slower, deeper) |
 | `--local` | Local Claude-only council when you have no provider keys (see below) |
 | `--async` | Detach the query as a background job; fetch with `/claude-council:result` |
 | `--no-cache` | Force fresh queries, skip cache |
@@ -173,6 +176,9 @@ Assign different perspectives to each provider for more comprehensive reviews:
 
 # Use a preset
 /claude-council:ask --roles=balanced "Review this implementation"
+
+# Bind a role to a named provider instead of a position
+/claude-council:ask --roles=openrouter-2=security,perplexity=devil "Review this design"
 ```
 
 **Available roles:**
@@ -191,7 +197,22 @@ Assign different perspectives to each provider for more comprehensive reviews:
 - `architecture` - scalability, maintainability, simplicity
 - `review` - security, maintainability, dx
 
-Roles are assigned to providers in order, ensuring each provider approaches the question from a different angle.
+A bare list is **positional**: the first role goes to the first provider
+discovery returns, the second to the second, and so on. That is fine for a fixed
+roster and fragile for a growing one — adding a provider script shifts every
+later provider's role by one, and reordering `OPENROUTER_MODELS` reassigns which
+router seat plays which part. Both happen silently, because only non-empty roles
+are printed.
+
+`provider=role` pairs bind the two explicitly and survive both. The two forms
+cannot be mixed in one `--roles` (a bare entry alongside a keyed one is
+ambiguous); a pair naming a provider that is not being queried, or naming one
+provider twice, is refused rather than resolved; and any provider left without a
+role is named on stderr:
+
+```
+Note: no role for openai grok
+```
 
 ### Debate Mode
 
@@ -218,9 +239,11 @@ Combine with roles for focused debates:
 
 ### Agent-Enhanced Analysis (--agents)
 
-For complex decisions where deeper analysis justifies the extra time and cost, `--agents` spawns
-parallel Claude subagents that each independently query, evaluate, and analyze their provider's
-response before the orchestrator synthesizes everything.
+For complex decisions where deeper analysis justifies the extra time and cost, `--agents` runs
+one Workflow of parallel Claude analyst agents that each independently query, evaluate, and
+analyze their provider's response before the orchestrator synthesizes everything. Each analysis
+is returned as schema-enforced structured output, and an interrupted run can be resumed with the
+finished analysts served from cache. Needs a Claude Code with the Workflow tool.
 
 ```bash
 # Explicit flag
@@ -230,7 +253,7 @@ response before the orchestrator synthesizes everything.
 /claude-council:ask --agents --roles=security,scalability --providers=gemini,openai "Review this auth architecture"
 ```
 
-**What each subagent does (beyond a simple API call):**
+**What each analyst does (beyond a simple API call):**
 1. Queries the provider
 2. Evaluates response quality - did it actually address the question?
 3. If the response is vague or off-topic, reformulates and retries
@@ -246,7 +269,7 @@ response before the orchestrator synthesizes everything.
 If your question contains architecture, security review, tradeoff analysis, or similar
 signals, you'll be asked whether to enable agent mode.
 
-**Cost and performance implications**: Agent mode spawns one Claude subagent per provider.
+**Cost and performance implications**: Agent mode runs one Claude analyst agent per provider.
 This means ~4x more Claude API usage and ~15-25 seconds additional latency compared to
 standard mode. Use it for high-stakes decisions, not quick questions.
 
@@ -352,8 +375,8 @@ Attach one image (e.g. a UI screenshot) so vision-capable providers can critique
 ```
 
 - Single image per query, raw size up to 10 MB, extensions: png / jpg / jpeg / webp / gif.
-- `gemini`, `openai`, `grok`, and `perplexity` receive the image alongside the prompt.
-- CLI providers answer through their vision sibling: `codex` via `openai`, `antigravity` via `gemini`, `grok-cli` via `grok` (the slot is marked as a fallback). `kimi-cli`'s sibling `kimi` is text-only, so an image is never routed there. If the sibling is unusable (no API key), not vision-capable, or already answering in its own slot, the CLI provider answers text-only instead and its answer is prefixed with `(answered without the image)`. Selecting `kimi` or `ollama` directly is likewise text-only.
+- `gemini`, `openai`, `grok`, `perplexity`, `kimi` and `openrouter` (on its default model) receive the image alongside the prompt.
+- CLI providers answer through their vision sibling: `codex` via `openai`, `antigravity` via `gemini`, `grok-cli` via `grok`, `kimi-cli` via `kimi` (the slot is marked as a fallback). If the sibling is unusable (no API key), not vision-capable, or already answering in its own slot, the CLI provider answers text-only instead and its answer is prefixed with `(answered without the image)`. Selecting `ollama` directly is text-only.
 
 Privacy: the image is sent to the providers that can see it, but its bytes are **not** written to cache entries or the saved `council-*.md` transcripts — only a hash of the image keys the cache.
 
@@ -438,7 +461,30 @@ export XAI_API_KEY="your-key"          # GROK_API_KEY also accepted
 export PERPLEXITY_API_KEY="your-key"
 export KIMI_API_KEY="your-key"         # MOONSHOT_API_KEY is read as a fallback,
                                        # but only KIMI_API_KEY makes kimi discoverable
+export OPENROUTER_API_KEY="your-key"   # one key, any model on openrouter.ai/models
 ```
+
+`openrouter` seats whatever model `OPENROUTER_MODEL` names, defaulting to
+`anthropic/claude-sonnet-5` — the one vendor the council has no direct seat for.
+To seat several routed models at once, list them instead:
+
+```bash
+export OPENROUTER_MODELS="deepseek/deepseek-v3.2,z-ai/glm-5.3,qwen/qwen3-max"
+```
+
+Each entry becomes its own council member — `openrouter-1`, `openrouter-2`,
+`openrouter-3` — with its own header, model label, cache entry and role, all
+sharing the one key. `--providers=openrouter-2` picks one out. The list replaces
+the single `openrouter` seat rather than adding to it, so the same model never
+answers twice under two headers. Reordering the list reassigns the numbers, which
+matters only if you pin roles positionally. A seat that should accept images opts
+in by number (`OPENROUTER_2_VISION=1`): the roster can hold any model, and nothing
+in the id says whether it reads images.
+Two things follow from it being a router. Your prompt reaches OpenRouter and then
+the upstream serving that id, so it is two disclosures rather than one. And
+pointing it at a model another seat already runs (`OPENROUTER_MODEL=openai/gpt-5.6`
+alongside `OPENAI_API_KEY`) gives you two headers voicing one model: the synthesis
+is told to read that agreement as possible duplication, not corroboration.
 
 `ollama` needs no key at all: install it, pull a model, and it joins the council
 as a local provider.
@@ -538,8 +584,10 @@ provider, named by its provider id. With `ollama` it never leaves the machine.
 With a CLI provider (`codex`, `antigravity`, `grok-cli`, `kimi-cli`) it stays
 within that tool's own subscription auth; with an API provider (`gemini`,
 `openai`, `grok`, `perplexity`, `kimi`) the diff is transmitted to that
-third-party API — `kimi` sends it to Moonshot. Keep the reviewer on `ollama`,
-or on a CLI provider, if your working tree may contain secrets.
+third-party API — `kimi` sends it to Moonshot. `openrouter` is the one seat that
+discloses twice: to OpenRouter, and onward to whichever upstream serves the model
+id you pinned. Keep the reviewer on `ollama`, or on a CLI provider, if your
+working tree may contain secrets.
 
 ## Reference
 
@@ -554,10 +602,32 @@ export GEMINI_MODEL="gemini-pro-latest"             # default (tracks Google's c
 export OPENAI_MODEL="gpt-5.6-sol"                   # default
 export GROK_MODEL="grok-latest"                     # default (tracks xAI's current flagship)
 export PERPLEXITY_MODEL="sonar-reasoning-pro"       # default (reasoning + search)
-export KIMI_MODEL="kimi-k3"                         # default
+export KIMI_MODEL="kimi-k3"                         # default (reads images)
+export KIMI_VISION=1                                # only needed when KIMI_MODEL
+                                                    # names an image-capable model
+                                                    # other than the default
+export COUNCIL_AGENT_MODEL="sonnet"                 # default: the model the --agents
+                                                    # ANALYSTS run on (sonnet/opus/haiku/fable).
+                                                    # Not a provider model — see below.
+export OPENROUTER_MODEL="anthropic/claude-sonnet-5"  # default (single seat)
+export OPENROUTER_MODELS="a/b,c/d,e/f"              # or: one seat per entry
+export OPENROUTER_2_MODEL="c/d-pinned"              # overrides roster seat 2's entry;
+                                                    # what the exit-3 degrade path sets
+export OPENROUTER_VISION=1                          # only needed when OPENROUTER_MODEL
+                                                    # names a model that accepts images
+export OPENROUTER_2_VISION=1                        # same, for roster seat 2
 export OLLAMA_MODEL="llama3.2"                      # default: whichever model `ollama list` shows first
 export OLLAMA_HOST="http://localhost:11434"         # default
+export GEMINI_THINKING_BUDGET=8192                  # optional: cap Gemini's internal reasoning tokens (unset: the model decides)
 ```
+
+`COUNCIL_AGENT_MODEL` is the odd one out: every other variable here names a model
+that *answers* the question, while this one names the Claude analyst that wraps a
+provider in `--agents` mode — it runs the query, judges the reply and returns a
+structured analysis. It is pinned rather than inherited from your session, so the
+cost of a mode that already spawns one agent per provider does not swing by a
+factor of several depending on which model you happen to be running. One measured
+run of eight seats came to ~456k analyst tokens.
 
 Gemini and Grok default to their vendor's rolling alias, so the council follows
 a new flagship without a release. Pin an explicit id when you need a fixed model
@@ -591,6 +661,7 @@ in the response header:
 | perplexity | `sonar-reasoning-pro` | `sonar-pro` |
 | kimi | `kimi-k3` | `kimi-k2.6` |
 | ollama | first local model (`OLLAMA_MODEL` to pin) | — |
+| openrouter | `anthropic/claude-sonnet-5` | — |
 
 The same substitution is also noted on stderr and folded into the synthesis,
 so it's visible even in quiet mode or a headless run. Setting `<PROVIDER>_MODEL`
@@ -612,10 +683,16 @@ For reasoning models from any provider, the token limit is automatically increas
 The bump applies to:
 
 - **OpenAI**: `codex-*`, `*-codex`, `o3-*`, `o4-*`, `gpt-5.[4-9]*`
-- **Gemini**: `gemini-3*`, `*thinking*`
-- **Grok**: `*reasoning*`, `grok-4*`, `grok-3-mini-*`, `grok-build-*`
+- **Gemini**: `gemini-3*`, `*thinking*`, `gemini-*-latest`
+- **Grok**: `*reasoning*`, `grok-4*`, `grok-3-mini-*`, `grok-build-*`, `grok-latest`
 - **Perplexity**: `sonar-reasoning*`, `*deep-research*`
 - **Kimi**: `kimi-k*` (so the default model always triggers the bump)
+- **OpenRouter**: `*reasoning*`, `*thinking*`, `*r1*`, `*deepseek*`, `*qwen*`,
+  `*gpt-oss*`, and the o-series anchored to the vendor slash (`*/o1*`, `*/o3*`,
+  `*/o4*`) so an unrelated id merely containing `o3` is not swept in. The seat
+  is retargetable, so the bump keys off the routed id's shape rather than a
+  fixed model list, and it errs toward bumping: `max_tokens` is a ceiling, not a
+  spend, while too low a ceiling truncates the answer mid-sentence
 - **Ollama**: `*r1*`, `*reason*`, `*gpt-oss*`, `qwen*`, `gemma*`, `deepseek*`
 
 | Model Type | COUNCIL_MAX_TOKENS | Actual Limit |
@@ -734,6 +811,11 @@ bash scripts/query-council.sh --list-available
 
 # List the providers that would be queried by default (machine-readable)
 bash scripts/query-council.sh --list-default
+
+# Same set, each paired with the model it would send: "<provider>\t<model>" per
+# line. Router seats carry no model in their name, so this is what a picker or
+# any other tool needs to label them.
+bash scripts/query-council.sh --list-default-models
 ```
 
 **JSON output structure:**
@@ -759,6 +841,7 @@ bash scripts/query-council.sh --list-default
 - `curl` and `jq` for API calls
 - Valid API keys for at least one provider, OR `codex` / `agy` (Antigravity) / `grok` / `kimi` CLI installed, OR `ollama` running locally
 - Optional: a Rich-capable Python (`python3` with a modern `rich`, or `uv`) upgrades the tmux pane's markdown rendering; without it the built-in perl renderer is used
+- macOS, Linux, or Windows via Git Bash; the test suite runs on all three in CI
 
 ## Development
 

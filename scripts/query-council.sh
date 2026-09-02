@@ -50,6 +50,7 @@ Note: Flags accept both --flag=value and --flag value formats.
   --no-pane           Disable streaming tmux pane (default: on inside tmux)
   --list-available    List configured providers (human-readable, with policy info)
   --list-default      List providers that would be queried by default (machine-readable)
+  --list-default-models  Same set, one "<provider>\t<model>" per line (machine-readable)
 
 Output: JSON with metadata and provider responses
 EOF
@@ -61,6 +62,7 @@ FILTER_PROVIDERS=""
 PROMPT=""
 LIST_AVAILABLE=false
 LIST_DEFAULT=false
+LIST_DEFAULT_MODELS=false
 USE_CACHE=true
 ROLES=""
 DEBATE_MODE=false
@@ -150,6 +152,10 @@ while [[ $# -gt 0 ]]; do
             LIST_DEFAULT=true
             shift
             ;;
+        --list-default-models)
+            LIST_DEFAULT_MODELS=true
+            shift
+            ;;
         --prompt=*)
             PROMPT="${1#*=}"
             shift
@@ -187,6 +193,20 @@ done
 # would actually run (post CLI-prefers-API filter). For tooling.
 if [[ "$LIST_DEFAULT" == true ]]; then
     default_provider_set
+    exit 0
+fi
+
+# --list-default-models: the same set, each name paired with the model it would
+# actually query, tab-separated. The /ask picker labels an option by its model —
+# that is what distinguishes one from another, and router seats (openrouter-1..N)
+# carry no model in their name at all. Derived from default_provider_set and
+# get_model rather than restated, so it cannot name a provider --list-default
+# would not, or a model the query would not send.
+if [[ "$LIST_DEFAULT_MODELS" == true ]]; then
+    read -ra LDM_SET <<< "$(default_provider_set)"
+    for p in "${LDM_SET[@]+"${LDM_SET[@]}"}"; do
+        printf '%s\t%s\n' "$p" "$(get_model "$p")"
+    done
     exit 0
 fi
 
@@ -381,6 +401,12 @@ run_provider_with_model_fallback() {
     local provider="$1" script="$2" prompt="$3" img="${4:-}" mime="${5:-}"
     local override_var preferred fallback keyhash resp rc=0
 
+    # Several seats can share one script (the router's roster), so the script
+    # cannot infer its own identity from its filename. Naming the seat here is
+    # what lets it resolve its own model instead of the script's default. Each
+    # provider runs in its own subshell, so this cannot leak between seats.
+    export COUNCIL_SEAT="$provider"
+
     override_var="$(provider_env_prefix "$provider")_MODEL"
     preferred=$(get_model "$provider")
     fallback=$(model_fallback_for "$provider")
@@ -474,7 +500,7 @@ attempt_api_fallback() {
         [[ -n "$cached" ]] && resp="$cached"
     fi
     if [[ -z "${resp:-}" ]]; then
-        sibling_script="${PROVIDERS_DIR}/${sibling}.sh"
+        sibling_script="$(provider_script_path "$sibling")"
         local sib_img="" sib_mime=""
         if [[ -n "${IMAGE_B64_FILE:-}" ]] && provider_vision_capable "$sibling"; then
             sib_img="$IMAGE_B64_FILE"; sib_mime="$IMAGE_MIME"
@@ -538,7 +564,8 @@ query_provider() {
     local prompt="$2"
     local output_file="$3"
     local role="${4:-}"
-    local script="${PROVIDERS_DIR}/${provider}.sh"
+    local script
+    script="$(provider_script_path "$provider")"
     local preferred fallback keyhash override_var
     local model model_fallback=""
     preferred=$(get_model "$provider")
@@ -669,25 +696,27 @@ WHITE='\033[37m'
 RED='\033[31m'
 GREEN='\033[32m'
 CYAN='\033[36m'
+MAGENTA='\033[35m'
+BRIGHT_BLACK='\033[90m'
 LIGHT_YELLOW='\033[93m'
 ITALIC='\033[3m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-# provider_color and provider_emoji are defined in lib/providers.sh
+# provider_color and provider_swatch are defined in lib/providers.sh
 # (sourced near the top of this file).
 
 # Get model name for provider (mirrors logic in provider scripts)
 # get_model is defined in lib/providers.sh (sourced near the top of this file).
 
-# Format provider list with colors and emojis
+# Format provider list with colour swatches and names
 format_providers() {
     local formatted=""
-    local color emoji
+    local color swatch
     for p in "$@"; do
         color=$(provider_color "$p")
-        emoji=$(provider_emoji "$p")
-        formatted+="${emoji} ${color}${p}${RESET} "
+        swatch=$(provider_swatch "$p")
+        formatted+="${swatch} ${color}${p}${RESET} "
     done
     echo "$formatted"
 }
@@ -899,7 +928,7 @@ if [[ "$DEBATE_MODE" == true ]]; then
     for provider in "${PROVIDERS[@]}"; do
         # Round 2: no role, skip cache (rebuttals depend on round 1 content)
         (
-            script="${PROVIDERS_DIR}/${provider}.sh"
+            script="$(provider_script_path "$provider")"
             model=$(get_model "$provider")
             output_file="${TEMP_DIR}/${provider}_r2.json"
 
@@ -915,8 +944,10 @@ if [[ "$DEBATE_MODE" == true ]]; then
             else
                 envelope=$(run_provider_with_model_fallback "$provider" "$script" "$debate_prompt") && r2_rc=0 || r2_rc=$?
                 if [[ ${r2_rc:-0} -eq 0 ]]; then
-                    jq -n --argjson e "$envelope" \
-                        '{status: "success", response: $e.response, model: $e.model, model_fallback: $e.model_fallback}' > "$output_file"
+                    # The envelope carries the full rebuttal, which embeds every
+                    # round-1 answer: stdin, never argv — see merge_result for
+                    # the MSYS ARG_MAX rationale.
+                    printf '%s' "$envelope" | jq '{status: "success", response: .response, model: .model, model_fallback: .model_fallback}' > "$output_file"
                 else
                     fb_json=$(attempt_api_fallback "$provider" "$debate_prompt")
                     if [[ -n "$fb_json" ]]; then

@@ -389,6 +389,17 @@ model = "gpt-root-wins"'
     [[ "$output" == "YES" ]]
 }
 
+@test "discover_providers: OPENROUTER_API_KEY enlists the seat and nothing shadows it" {
+    # The seat needed no arm in discover_providers: it rides the generic
+    # <NAME>_API_KEY branch. That is only true while the script is named for the
+    # env var and no SHADOW_PAIRS entry claims it, so assert the outcome rather
+    # than the branch.
+    export OPENROUTER_API_KEY=x
+    run source_lib_and_call 'default_provider_set'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"openrouter"* ]]
+}
+
 # ============================================================================
 # coerce_result_json — collection-loop JSON guard (issue #3)
 #
@@ -636,6 +647,39 @@ EOF
     [[ "$output" == *"codex"* ]]
     [[ "$output" == *"Shadowed"* ]]
     [[ "$output" == *"openai"* ]]
+}
+
+# The /ask provider picker labels each option with its model, because the model
+# is what makes an option meaningful. Router seats are named openrouter-1..N and
+# deliberately do not carry their model, so without this the picker renders N
+# identical-looking rows. The command layer cannot resolve them itself: ask.md's
+# allowed-tools admits only the council's own scripts, not a shell that could
+# source providers.sh.
+@test "query-council: --list-default-models pairs every default provider with its model" {
+    export OPENROUTER_API_KEY=k
+    export OPENROUTER_MODELS="deepseek/deepseek-v3.2,z-ai/glm-5.3"
+    export PATH=$(path_without_clis)
+    run bash "$SCRIPT" --list-default-models
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"openrouter-1"$'\t'"deepseek/deepseek-v3.2"* ]]
+    [[ "$output" == *"openrouter-2"$'\t'"z-ai/glm-5.3"* ]]
+    # One line per provider, name and model only.
+    [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -eq 2 ]
+    [ "$(printf '%s\n' "$output" | awk -F'\t' '{print NF}' | sort -u)" = "2" ]
+}
+
+@test "query-council: --list-default-models names exactly what --list-default names" {
+    # Two views of one set. If they can disagree, the picker offers a provider
+    # the query would not run, or omits one it would.
+    export OPENROUTER_API_KEY=k
+    export OPENROUTER_MODELS="deepseek/deepseek-v3.2,z-ai/glm-5.3,qwen/qwen3-max"
+    export PATH=$(path_without_clis)
+    run bash "$SCRIPT" --list-default
+    local plain="$output"
+    run bash "$SCRIPT" --list-default-models
+    local paired
+    paired=$(printf '%s\n' "$output" | cut -f1 | tr '\n' ' ')
+    [ "$(echo $plain)" = "$(echo $paired)" ]
 }
 
 @test "query-council: --list-default returns post-policy set, machine-readable" {

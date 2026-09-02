@@ -38,7 +38,14 @@ unset COUNCIL_PROVIDERS
 # exporting these, and a pinned one wins over the default the suite asserts.
 # A test that wants an override sets it on its own invocation.
 unset GEMINI_MODEL OPENAI_MODEL GROK_MODEL PERPLEXITY_MODEL KIMI_MODEL OLLAMA_MODEL
-unset CODEX_MODEL ANTIGRAVITY_MODEL GROK_CLI_MODEL KIMI_CLI_MODEL
+unset CODEX_MODEL ANTIGRAVITY_MODEL GROK_CLI_MODEL KIMI_CLI_MODEL OPENROUTER_MODEL
+# OPENROUTER_VISION is read alongside OPENROUTER_MODEL by provider_vision_capable,
+# so a developer who exported it would flip the vision answer the suite asserts.
+unset OPENROUTER_VISION KIMI_VISION
+# OPENROUTER_MODELS splits the router into numbered seats and COUNCIL_SEAT tells
+# the script which one it is running as: either left set would change the roster
+# the suite asserts.
+unset OPENROUTER_MODELS COUNCIL_SEAT
 
 # Setup - runs before each test
 setup() {
@@ -59,7 +66,7 @@ command_exists() {
 # Helper: clear every provider API key so discovery sees none of them
 unset_provider_keys() {
     unset GEMINI_API_KEY OPENAI_API_KEY GROK_API_KEY XAI_API_KEY PERPLEXITY_API_KEY
-    unset KIMI_API_KEY MOONSHOT_API_KEY
+    unset KIMI_API_KEY MOONSHOT_API_KEY OPENROUTER_API_KEY
 }
 
 # Helper: block until any of the given files exists. Gives up after ~8s so a
@@ -108,6 +115,43 @@ path_without_clis() {
         clean=$(echo "$clean" | tr ':' '\n' | grep -vF -- "$dir" | tr '\n' ':')
     done
     echo "${clean%:}"
+}
+
+# Helper: put a jq on PATH whose stdout ends every line with \r\n, as jq's
+# Windows build does when piped. Sets CRLF_BIN; prefix PATH="$CRLF_BIN:$PATH"
+# on the one invocation under test so the test's own jq calls stay clean.
+install_crlf_jq() {
+    local real_jq
+    real_jq=$(command -v jq)
+    CRLF_BIN="${BATS_TEST_TMPDIR}/crlf-bin"
+    mkdir -p "$CRLF_BIN"
+    cat > "$CRLF_BIN/jq" <<EOF
+#!/bin/bash
+"$real_jq" "\$@" | sed 's/\$/\r/'
+exit "\${PIPESTATUS[0]}"
+EOF
+    chmod +x "$CRLF_BIN/jq"
+    export CRLF_BIN
+}
+
+# Helper: put a jq on PATH that records every argument it is given, then execs
+# the real one. Sets JQ_BIN (prefix it onto PATH) and JQ_ARGV_FILE. Used to
+# prove a large prompt is never passed to jq on the command line, where MSYS's
+# ~32KB ARG_MAX would reject it.
+install_recording_jq() {
+    local real_jq
+    real_jq=$(command -v jq)
+    JQ_BIN="${BATS_TEST_TMPDIR}/jq-bin"
+    JQ_ARGV_FILE="${BATS_TEST_TMPDIR}/jq-argv"
+    mkdir -p "$JQ_BIN"
+    : > "$JQ_ARGV_FILE"
+    cat > "$JQ_BIN/jq" <<EOF
+#!/bin/bash
+printf '%s\n' "\$@" >> "$JQ_ARGV_FILE"
+exec "$real_jq" "\$@"
+EOF
+    chmod +x "$JQ_BIN/jq"
+    export JQ_BIN JQ_ARGV_FILE
 }
 
 # Helper: assert JSON field equals value

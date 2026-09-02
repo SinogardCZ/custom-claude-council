@@ -41,31 +41,34 @@ bats --verbose-run tests/cache.bats
 | File | Tests | Coverage |
 |------|-------|----------|
 | `cache.bats` | 26 tests | cache_key (incl. verbosity/token/image components), cache_get/set, cache_valid, TTL, clear, self-ignoring dir |
-| `cli-providers.bats` | 65 tests | codex/antigravity/grok-cli/kimi-cli/ollama discovery, CLI-prefers-API policy, shadow_origin↔api_sibling single source, --list-available / --list-default, flag parsing, coerce_result_json JSON guard, CLI→API fallback (dedup, cache reuse, missing-script, round 2), gated E2E |
+| `cli-providers.bats` | 68 tests | codex/antigravity/grok-cli/kimi-cli/ollama discovery, CLI-prefers-API policy, shadow_origin↔api_sibling single source, --list-available / --list-default, flag parsing, coerce_result_json JSON guard, CLI→API fallback (dedup, cache reuse, missing-script, round 2), a new API seat riding the generic `<NAME>_API_KEY` branch into the default set, `--list-default-models` pairing each default provider with the model it would send and naming exactly what `--list-default` names, gated E2E |
 | `display.bats` | 44 tests | tmux/iTerm2 detection, wrapper no-op behavior, manifest writes, pane gating, tty probe, pane env forwarding, retry-await window floor, waiting-line truncation + autowrap guard, renderer selection (Rich feature probe, uv route + timeout, perl fallback, COUNCIL_RENDERER=perl, runtime fallback + stdout forwarding, think-block styling incl. unclosed tags, code-theme direction, link style, COLUMNS=0) |
 | `keys.bats` | 7 tests | XAI_API_KEY ↔ GROK_API_KEY resolution, precedence, silent-conflict policy |
-| `roles.bats` | 47 tests | presets, validation, prompt injection, assignment, local-council role resolution + member count |
+| `roles.bats` | 56 tests | presets, validation, prompt injection, positional and `provider=role` assignment (mixed forms, an absent provider and a duplicate provider all refused; roleless providers named on stderr; an empty roster refused under `set -u` on bash 3.2), local-council role resolution + member count |
 | `tokens.bats` | 9 tests | reasoning-model token-cap bumping, glob patterns, floor, multi-pattern |
 | `verbosity.bats` | 9 tests | brief/standard/detailed directives, fallback to standard |
 | `query-council.bats` | 33 tests | argument parsing, error cases, flags, local-council fallback hint, hyphenated provider names (env-var prefix derivation), model-fallback wrapper (preferred-then-fallback retry, cached-verdict skip, explicit `<PROVIDER>_MODEL` opt-out, no verdict remembered when the fallback also fails), round 2 and CLI-sibling fallback carrying `model_fallback`, the pane's retry offer (offer file contents, r re-queries only the failed providers and clears the error list, expiry, pane closed at the offer, `COUNCIL_RETRY_WAIT=0`, no pane, a leaked non-watch-dir `COUNCIL_PANE_DIR` ignored) |
 | `argmax.bats` | 4 tests | large response/prompt/debate-round-2 round-trip through final JSON (MSYS ARG_MAX marshalling guard) |
-| `fake-clis.bats` | 62 tests | fixture self-checks, codex.sh/antigravity.sh/grok-cli.sh/kimi-cli.sh/ollama.sh against fake binaries (kimi-cli: stream-json parsing, dirty-stream tolerance, array-form content, tool-call narration excluded, no-tools agent pinned; ollama: daemon-down diagnostic; antigravity: the argv spill past `COUNCIL_ARGV_LIMIT`, its dedicated `--add-dir` directory, the guard and system prompt staying on argv while only the question is written out, cleanup after a failing CLI and under a spaced `TMPDIR`; `COUNCIL_PROVIDERS` roster precedence and its agreement with `--list-default` and `--list-available`; per-CLI timeout bounds via `COUNCIL_CLI_TIMEOUT`, and that a timeout reports only the timeout, never the shell's own signal notice) |
-| `format-output.bats` | 13 tests | defensive parsing: empty/missing/non-string responses, raw preservation, CLI→API fallback-note rendering, model-fallback note (preferred model named, absent when unset) |
+| `fake-clis.bats` | 63 tests | fixture self-checks, codex.sh/antigravity.sh/grok-cli.sh/kimi-cli.sh/ollama.sh against fake binaries (kimi-cli: stream-json parsing, dirty-stream tolerance, array-form content, tool-call narration excluded, no-tools agent pinned; ollama: daemon-down diagnostic; antigravity: the argv spill past `COUNCIL_ARGV_LIMIT`, its dedicated `--add-dir` directory, the guard and system prompt staying on argv while only the question is written out, cleanup after a failing CLI and under a spaced `TMPDIR`; `COUNCIL_PROVIDERS` roster precedence and its agreement with `--list-default` and `--list-available`; per-CLI timeout bounds via `COUNCIL_CLI_TIMEOUT`, a CLI that exits 0 on the deadline's SIGTERM still reported as a timeout, and that a timeout reports only the timeout, never the shell's own signal notice) |
+| `format-output.bats` | 14 tests | defensive parsing: empty/missing/non-string responses, raw preservation, CLI→API fallback-note rendering, model-fallback note (preferred model named, absent when unset), the first provider key surviving CRLF from a Windows jq |
 | `prompts.bats` | 11 tests | template loading, {{VAR}} interpolation, role-injection rendering |
-| `agent-analysis.bats` | 11 tests | validate-analysis.sh contract enforcement, schema sync |
-| `check-status.bats` | 27 tests | two-tier CLI availability, remediation strings, HTTP probe branches (401/403/500/000), rejected-key classification (Gemini/xAI answer a bad key with 400, not 401) and its false-positive guards (a typo'd model is not a bad key), transfer-failure exit codes, curl writing nothing, unusable jq, Perplexity's minimum max_tokens, `-X POST` and `--max-time` on every probe, temp-file cleanup, keys off the curl argv, ms clock |
-| `jobs.bats` | 17 tests | job store, --async lifecycle, --result/--jobs/--cancel, self-ignoring cache dir |
-| `stop-gate.bats` | 10 tests | opt-in gating, loop guards, BLOCK verdict, fail-open |
+| `agent-analysis.bats` | 11 tests | validate-analysis.sh as the executable mirror of the agent-analysis schema, kept in sync with it |
+| `check-status.bats` | 19 tests | two-tier CLI availability, remediation strings, HTTP probe branches (401/403/500/000), rejected-key classification (Gemini/xAI answer a bad key with 400, not 401) and its false-positive guards (a typo'd model is not a bad key), transfer-failure exit codes, curl writing nothing, unusable jq, Perplexity's minimum max_tokens, every row's status beginning at the same column, a roster seat row keeping the export hint |
+| `check-status-probe.bats` | 13 tests | the probes themselves rather than what they report: `-X POST` and `--max-time` on every probe, OpenRouter probed at `/api/v1/key` rather than the `/api/v1/models` endpoint that answers 200 without a key, Perplexity's minimum max_tokens, temp-file cleanup, keys off the curl argv, an unusable jq, curl writing nothing, ms clock |
+| `jobs.bats` | 18 tests | job store, --async lifecycle, --result/--jobs/--cancel (incl. the worker tree dying when jq emits CRLF), self-ignoring cache dir |
+| `router-seats.bats` | 15 tests | `OPENROUTER_MODELS` splitting the one router script into numbered seats: per-seat `get_model` (roster entry, `<SEAT>_MODEL` override, out-of-range, zero, leading-zero and non-numeric seat numbers all reporting `unknown` rather than a neighbour's id or an arithmetic abort), discovery replacing rather than joining the single seat, `provider_script_path` mapping every seat back to one script, per-seat vision opt-in, colour and swatch not falling to the unknown-provider default, every provider's swatch drawing to the same width, every palette name provider_color asks for being defined by both rendering callers, and an end-to-end run asserting each seat both is labelled with and actually queried its own model |
+| `stop-gate.bats` | 12 tests | opt-in gating, loop guards, BLOCK verdict, fail-open, an allowlisted API seat actually reaching the reviewer, config/event reads surviving CRLF from a Windows jq |
 | `theme.bats` | 24 tests | terminal theme detection, theme-aware emphasis + muted-text (faint/gray) rendering |
-| `providers.bats` | 44 tests | API provider payloads (gemini, openai, grok, perplexity, kimi), the default model each one queries and the reasoning-token cap its id earns (the `*-latest` aliases included), response parsing, endpoint routing, secret/payload hygiene, vision image injection (gemini inlineData, openai input_image/image_url, grok/perplexity image_url), model-unavailable exit-3 classification per provider (grok 403 region block, openai/gemini/perplexity 404/400) vs. ordinary errors (401/500) still exiting 1, bare-string `.error` extraction without crashing, the temperature Moonshot's models accept, and a gated real-endpoint acceptance check per provider |
-| `image.bats` | 9 tests | --image validation (missing/bad-type/oversize), vision routing, CLI→sibling routing (only when the sibling can see), non-vision text-only tag, base64 never in the cache |
+| `providers.bats` | 87 tests | API provider payloads (gemini, openai, grok, perplexity, kimi; gemini's multi-part text join, empty-200 diagnostics and the opt-in thinking cap), the default model each one queries and the reasoning-token cap its id earns (the `*-latest` aliases included), response parsing, endpoint routing, secret/payload hygiene (including a large prompt never reaching jq's argv, per provider, and the image base64 — the larger of the two payloads — never reaching it either, per vision provider and across perplexity's recency branch), vision image injection (gemini inlineData, openai input_image/image_url, grok/perplexity image_url), model-unavailable exit-3 classification per provider (grok 403 region block, openai/gemini/perplexity 404/400) vs. ordinary errors (401/500) still exiting 1, bare-string `.error` extraction without crashing, the temperature Moonshot's models accept, and a gated real-endpoint acceptance check per provider. OpenRouter carries its own block: errors arriving inside an HTTP 200 classified on `.error.code`, the live API's 400-for-an-unknown-slug separated from an ordinary bad-parameter 400 and both from 404, while 401/402/403/429/5xx exit 1, a null `.choices` content refused rather than answered, the routed `.model` logged to stderr only under debug, exactly one `model` id sent (never `models[]` or `route`), a slash/tilde model id surviving MSYS in the payload, a stale `COUNCIL_SEAT` the roster cannot have leaving the default model, and routed reasoning ids (r1, o-series, qwen) earning the token bump while an ordinary id keeps the plain cap |
+| `image.bats` | 10 tests | --image validation (missing/bad-type/oversize), vision routing, CLI→sibling routing (only when the sibling can see), non-vision text-only tag, base64 never in the cache |
 | `pane-watcher.bats` | 16 tests | standalone pane watcher: banner + response render, error notice (incl. text with no trailing newline, as the producer writes it), retry offer (prompt + countdown, r hands back to the live loop, esc closes, withdrawn offer degrades to the plain close prompt, prompt clipped to the pane width with autowrap off, a second failure on retry replayed in its own words), SetMark, watch-dir cleanup, re-render of every shown block on a width change (mid-run and at the close prompt), replay order across responses and errors, no redraw while a drag is still moving, ctrl-d and closed-stdin exits |
 | `export.bats` | 5 tests | markdown transcript export writing + formatting |
 | `release.bats` | 5 tests | release.sh version bump/commit/tag, staged-index guard, green-suite gate |
 | `retry.bats` | 11 tests | curl_with_retry backoff + status handling, curl_secret_config off-argv config file, ensure_error_body http_status stamping (object and string `.error`, Gemini's string `.error.status` left alone, synthesised message, 200 passthrough) |
 | `model_fallback.bats` | 29 tests | is_model_unavailable_error classifier (positive/negative fixtures from real vendor bodies), model_fallback_for pairs and the invariant that no provider degrades to the model it already prefers, verdict cache (TTL, provider+model+key scoping, corrupt/fractional-timestamp guards), model_fallback_key_hash, gated real-API test (default model or its fallback answers, end to end) |
+| `deadline.bats` | 9 tests | run_with_deadline: the caller's stdin reaches the command, the command's own status passes through, status 143 at the deadline whatever the command did with the signal (a CLI that exits 0 on SIGTERM), SIGKILL after the grace period for one that ignores it, the command's own children not holding the captured stdout, no watchdog outliving a fast call, nothing on stderr for a signal-ended job, 0 = unbounded, a non-integer deadline rejected |
 
-**Total: 538 tests** across 24 `.bats` files.
+**Total: 628 tests** across 27 `.bats` files.
 
 ### Hermetic CLI Fixture
 
@@ -81,7 +84,8 @@ setup() { install_fake_clis; }
 
 - `COUNCIL_FAKE_BEHAVIOR` switches scenarios: `valid` (default), `empty`,
   `malformed-json`, `block-verdict`, `rate-limit`, `auth-failure`,
-  `slow` (honors `COUNCIL_FAKE_SLEEP`), `hang`, `error`, and, for the kimi
+  `slow` (honors `COUNCIL_FAKE_SLEEP`), `hang`, `hang-handled` (exits 0 on the
+  deadline's SIGTERM, as the codex wrapper does), `error`, and, for the kimi
   fake only, `dirty-stream`, `array-content` and `tool-narration`.
 - `--version` always succeeds, mirroring real CLIs where the version probe
   works even when logged out.
@@ -110,8 +114,49 @@ they stay out of the default suite and out of CI.
 
 1. Create `tests/your_feature.bats`
 2. Load test helper: `load test_helper`
-3. Use bats syntax: `@test "description" { ... }`
+3. Use bats syntax: `@test "description" { ... }` — keep the name ASCII (see Windows below)
 4. Run: `bats tests/your_feature.bats`
+
+### Windows
+
+CI runs the suite on `windows-latest` under Git Bash, alongside Ubuntu and
+macOS. Budget 20-30 minutes: MSYS emulates `fork`, so a test that runs
+`query-council.sh` end to end costs 3–4 s there against 0.1–0.3 s on Linux.
+What Windows does that the others do not, and how to test for it without a
+Windows machine:
+
+- jq's Windows build CRLF-terminates piped stdout, and a `read < <(jq ...)`
+  keeps the `\r` (a `$(...)` strips it). `install_crlf_jq` in
+  `test_helper.bash` puts a jq on PATH that does the same; prefix
+  `PATH="$CRLF_BIN:$PATH"` on the one invocation under test.
+- MSYS rewrites POSIX-looking paths in argv and in environment values before a
+  native binary sees them, and its ARG_MAX is ~32 KB. Large or path-shaped
+  values reach jq on stdin.
+- bats on MSYS cannot look up a `@test` whose name has a non-ASCII character;
+  it reports `unknown test name` and the count comes up short.
+
+### macOS (bash 3.2)
+
+The macOS runner parses the suite with `/bin/bash` 3.2, where one construct
+behaves differently from bash 5 on the other two legs:
+
+- **3.2 scans comment text inside a process substitution instead of stripping
+  it.** It reads the comment lines inside `< <( ... )` looking for quotes and
+  parens before it strips comments, so two shapes break the run:
+
+  - an odd number of `'` across those comment lines leaves the parser holding an
+    open quote, which swallows the closing paren:
+    ``bad substitution: no closing `)' ``
+  - a stray `)` ends the substitution early:
+    `/dev/fd/62 ...: No such file or directory`
+
+  Write "the prompt reads it", never "the prompt's read", and keep parens out of
+  those comments. Both failures happen when bash expands the word, not when it
+  parses the file, so no static check finds them: `bash -n` reports the same
+  thing before and after the fix, and on a `.bats` file it means nothing anyway
+  (`@test NAME {` is not bash). Verify by running the test itself under
+  `/bin/bash`. Ubuntu and Windows run bash 5 and accept both shapes, so only the
+  macOS leg catches this.
 
 ---
 
@@ -520,8 +565,8 @@ rm combined-test.md
 ```
 
 **Expected**:
-- [ ] codex's slot is answered by openai, antigravity's by gemini, and grok-cli's by grok (marked as a fallback), all seeing the image
-- [ ] kimi-cli is NOT routed to its sibling: `kimi` cannot see, so kimi-cli answers text-only, prefixed `(answered without the image)`
+- [ ] codex's slot is answered by openai, antigravity's by gemini, grok-cli's by grok and kimi-cli's by kimi (each marked as a fallback), all seeing the image
+- [ ] `ollama`, selected directly, answers text-only, prefixed `(answered without the image)`
 
 ---
 
@@ -529,7 +574,7 @@ rm combined-test.md
 
 ### No API Keys and no CLI agents
 ```bash
-unset GEMINI_API_KEY OPENAI_API_KEY GROK_API_KEY XAI_API_KEY PERPLEXITY_API_KEY KIMI_API_KEY MOONSHOT_API_KEY
+unset GEMINI_API_KEY OPENAI_API_KEY GROK_API_KEY XAI_API_KEY PERPLEXITY_API_KEY KIMI_API_KEY MOONSHOT_API_KEY OPENROUTER_API_KEY
 # Strip /opt/homebrew/bin and ~/.nvm from PATH so codex/agy/grok/kimi/ollama aren't discovered (several install there via homebrew/npm)
 bash scripts/query-council.sh "Test question" 2>&1
 ```

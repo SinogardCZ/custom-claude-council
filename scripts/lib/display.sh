@@ -9,6 +9,12 @@
 # wrapper run as separate processes that inherit the tmux server's PATH and
 # cwd, so a relative path would not survive the hop.
 COUNCIL_DISPLAY_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=deadline.sh
+source "$COUNCIL_DISPLAY_DIR/deadline.sh"
+# provider_color_rgb lives with the rest of the provider identity tables. Sourced
+# here rather than assumed from the caller so this lib stays usable on its own.
+# shellcheck source=providers.sh
+source "$COUNCIL_DISPLAY_DIR/providers.sh"
 COUNCIL_RENDER_PL="$COUNCIL_DISPLAY_DIR/render.pl"
 COUNCIL_RENDER_PY="$COUNCIL_DISPLAY_DIR/render.py"
 COUNCIL_PANE_WATCHER="$COUNCIL_DISPLAY_DIR/pane-watcher.sh"
@@ -246,7 +252,7 @@ display_write_perl_renderer() {
 # exit 0, so an import-only probe would silently pick a mangling renderer.
 # Paths are absolute because the pane that runs the result inherits the tmux
 # server's PATH, not this shell's.
-# The uv probe is bounded by a perl alarm (COUNCIL_RICH_PROBE_TIMEOUT, default
+# The uv probe runs under run_with_deadline (COUNCIL_RICH_PROBE_TIMEOUT, default
 # 10s): a cold cache on a dead network otherwise stalls pane opening ~45s
 # before any provider is queried. --no-project keeps uv from resolving — and
 # syncing .venv/uv.lock into — whatever pyproject.toml the cwd contains. The
@@ -262,7 +268,7 @@ council_rich_python() {
         return 0
     fi
     uv=$(command -v uv 2>/dev/null) || uv=""
-    if [[ -n "$uv" ]] && perl -e 'alarm shift; exec @ARGV' "${COUNCIL_RICH_PROBE_TIMEOUT:-10}" \
+    if [[ -n "$uv" ]] && run_with_deadline "${COUNCIL_RICH_PROBE_TIMEOUT:-10}" \
         "$uv" run --quiet --no-project --with rich python3 -c "$probe" 2>/dev/null; then
         printf '%q %s' "$uv" 'run --quiet --no-project --offline --with rich python3'
         return 0
@@ -335,20 +341,6 @@ council_pane_env_args() {
     fi
 }
 
-# Provider vendor RGB triplet for 24-bit foreground text over the user's unknown
-# terminal background — each a mid-tone shade readable on light and dark themes.
-# Writes the triplet into the variable named by $1 (printf -v avoids a subshell).
-provider_color_rgb() {
-    local __out="$1"
-    case "$2" in
-        gemini|antigravity) printf -v "$__out" '59;130;246'   ;;  # blue-500
-        openai|codex)      printf -v "$__out" '100;116;139'  ;;  # slate-500
-        grok|grok-cli)     printf -v "$__out" '239;68;68'    ;;  # red-500
-        perplexity)        printf -v "$__out" '22;163;74'    ;;  # green-600
-        kimi)              printf -v "$__out" '168;85;247'   ;;  # purple-500
-        *)                 printf -v "$__out" '113;113;122'  ;;  # zinc-500
-    esac
-}
 
 # SGR parameter for muted/faint text (separators, the "waiting on" label).
 # ANSI 2 (faint) washes out on a light background, so light uses a dark-gray

@@ -1,14 +1,8 @@
 # Agent Prompt Template
 
-Fill in `{PROVIDER}`, `{SCRIPT_PATH}`, `{SCHEMA_PATH}`
-(`${CLAUDE_PLUGIN_ROOT}/schemas/agent-analysis.schema.json`), and `{QUESTION}`:
-
-Maintainer note: `schemas/agent-analysis.schema.json` has no model field, and
-the `## {EMOJI} {PROVIDER} ({MODEL})` header that `skills/deep-execution/SKILL.md`
-renders around each analysis is built by that skill, not by the subagent
-prompted below. A model-fallback re-run cannot correct that header — it keeps
-showing {PROVIDER}'s default model. The displacement is only visible in the
-analysis text.
+The analyst is given `{PROVIDER}`, `{PLUGIN_ROOT}` (the plugin's install
+directory) and `{QUESTION_FILE}` (the final question, written by the
+orchestrator):
 
 ```
 You are a council provider analyst for {PROVIDER}.
@@ -19,33 +13,40 @@ Query the {PROVIDER} AI provider and deliver a structured analysis of its respon
 
 ### Round 1: Initial Query
 
-Write the question to a file first, then query the provider reading from it. The
-quoted heredoc marker (`'COUNCIL_Q_EOF'`) means the shell does NOT interpret any
-quotes, backticks, or `$()` the question may contain — paste it verbatim, do not
-escape it:
+The question is in {QUESTION_FILE}. Read it, then query the provider from the
+file — `--prompt-file` keeps a large question (file context, a long brief) off
+the process argv, where the OS rejects it as "argument list too long":
 
 ```bash
-cat > /tmp/council-question.txt <<'COUNCIL_Q_EOF'
-{QUESTION}
-COUNCIL_Q_EOF
-COUNCIL_TIMEOUT=500 bash {SCRIPT_PATH} "$(cat /tmp/council-question.txt)"
+COUNCIL_TIMEOUT=500 bash "{PLUGIN_ROOT}/scripts/providers/{PROVIDER}.sh" --prompt-file "{QUESTION_FILE}"
 ```
+
+If that command exits non-zero with a status other than 3, the provider did
+not answer (a rejected key, a rate limit, a timeout, a CLI that is signed out).
+Carry the failure through to Round 3 as an analysis, so the orchestrator sees
+why: `quality` "poor", `confidence` "low", `retried` false, `full_response` the
+error text exactly as printed, one `key_recommendations` entry saying that
+{PROVIDER} did not answer and what the error says to do about it, and
+`unique_perspective` and `blind_spots` each stating that no perspective exists
+because the provider returned an error. Do not invent recommendations from an
+error message.
 
 If that command exits with status 3, the requested model is unavailable for
 this key or region. Do not report this as an error. Instead:
 
 1. Look up the replacement model:
    ```bash
-   source "${CLAUDE_PLUGIN_ROOT}/scripts/lib/model_fallback.sh"
+   source "{PLUGIN_ROOT}/scripts/lib/model_fallback.sh"
    model_fallback_for {PROVIDER}
    ```
 2. Re-run the same command with the fallback exported as `<PROVIDER>_MODEL` —
    the provider's name upper-cased with `_MODEL` appended. For example, for
    provider `grok`:
    ```bash
-   GROK_MODEL=grok-4.20-reasoning COUNCIL_TIMEOUT=500 bash {SCRIPT_PATH} "$(cat /tmp/council-question.txt)"
+   GROK_MODEL=grok-4.20-reasoning COUNCIL_TIMEOUT=500 bash "{PLUGIN_ROOT}/scripts/providers/grok.sh" --prompt-file "{QUESTION_FILE}"
    ```
-3. If the re-run also fails, report the original error.
+3. If the re-run also fails, carry the original error through to Round 3 as
+   described above.
 4. In `unique_perspective` (Round 3), open with one sentence naming both
    models — the one that was unavailable and the one that answered — so the
    displacement reaches the synthesis. There is no schema field for this, so
@@ -63,15 +64,28 @@ Evaluate the response:
 - Is it substantive (not vague or generic)?
 - Are there obvious gaps or unanswered aspects?
 
-If the response is **off-topic, vague, or missing key aspects**, formulate a targeted
-follow-up that addresses the gaps. Run the script again with the same `COUNCIL_TIMEOUT=500` prefix.
+If the response is **off-topic, vague, or missing key aspects**, formulate a
+targeted follow-up that addresses the gaps, write it to its own file and run the
+script again the same way. The file carries your provider's name: analysts
+without roles share one question file, and a shared follow-up path would let
+another analyst's follow-up reach your provider. The quoted heredoc marker means
+the shell does NOT interpret quotes, backticks or `$()` in the follow-up; paste
+it verbatim:
+
+```bash
+cat > "{QUESTION_FILE}.{PROVIDER}.followup" <<'COUNCIL_Q_EOF'
+<your follow-up, verbatim>
+COUNCIL_Q_EOF
+COUNCIL_TIMEOUT=500 bash "{PLUGIN_ROOT}/scripts/providers/{PROVIDER}.sh" --prompt-file "{QUESTION_FILE}.{PROVIDER}.followup"
+```
 
 If the response is good, skip the follow-up.
 
 ### Round 3: Structured Analysis
 
-Return ONLY a JSON object (no markdown fences, no prose before or after)
-matching {SCHEMA_PATH} (schemas/agent-analysis.schema.json):
+Return the analysis through the structured output tool you were given; it is
+checked against the plugin's `schemas/agent-analysis.schema.json` and a reply
+that does not match is sent back to you to fix. The object:
 
 {
   "quality": "good | fair | poor",
@@ -90,5 +104,4 @@ IMPORTANT:
 - full_response must contain the complete, unedited provider response
 - Be honest in your quality assessment - "good" means genuinely useful, not just "it returned text"
 - For blind_spots, think about what a different expert perspective might critique
-- Your reply will be machine-validated; anything that is not a single valid JSON object is treated as a failed analysis
 ```

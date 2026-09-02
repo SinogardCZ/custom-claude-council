@@ -4,6 +4,388 @@ All notable changes to claude-council are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to a `YYYY.M.BUILD` versioning scheme where `BUILD` resets each month.
 
+## Unreleased
+
+### Features
+
+- **`bump_for_reasoning` takes an optional `--ceiling`.** The helper is written
+  as a *raise*: it multiplies the base cap by eight and never returns less than
+  32768. For an API whose own limit sits below that floor, the raise is a
+  refusal — NVIDIA NIM documents `max_tokens` as 1..16384 for
+  `deepseek-v4-pro-0813` and rejects anything higher, so an unbounded bump turns
+  every call into a 400. `--ceiling N` bounds the result instead of skipping the
+  bump, so a reasoning model on such an endpoint keeps all the headroom the API
+  will actually give it.
+
+  The clamp runs last, after the floor. Applied before it, the floor would raise
+  the value straight back over the API's limit — the bug the ceiling exists to
+  prevent. It runs on both paths, matched pattern or not: a caller that raised
+  `COUNCIL_MAX_TOKENS` above the ceiling would otherwise slip past unbounded on
+  the no-match path.
+
+  It is an option prefix rather than a fifth positional argument because the
+  pattern list is variadic — anything appended to the end would be read as a
+  pattern. Callers that pass no `--ceiling` are unaffected, and all six existing
+  ones are unchanged.
+
+## 2026.9.2
+
+### Fixes
+
+- **A failing OpenRouter seat says why.** Three unrelated failures reached the
+  same branch and all printed "Unknown error": a wire error, a mid-generation
+  upstream failure, and a clean 200 whose content is empty. Only the first
+  carries a top-level `.error`. The seat now reads the choice-level error
+  OpenRouter documents for the second (an HTTP 200 with the error on the choice),
+  and for the third reports `finish_reason`, the upstream native reason, the
+  reasoning token spend and the size of any answer the upstream left in
+  `.reasoning`. `COUNCIL_DEBUG` dumps the raw body for a shape none of those
+  cover.
+- **Two `.error` reads could kill a seat without printing anything.** `gemini.sh`
+  indexed `.error.message` unguarded, so a body of 400 or worse carrying a
+  bare-string `.error` made jq raise, and under `set -eo pipefail` the seat
+  exited 5 with no error line at all. `openrouter.sh` had the same shape one
+  level down, where a scalar `.choices[0]` made the content read raise before the
+  branch that names the failure could run.
+- **The macOS CI leg is green again.** bash 3.2 scans comment text inside a
+  process substitution instead of stripping it, so an apostrophe added to a
+  comment in v2026.9.1 swallowed the closing paren in `tests/pane-watcher.bats`.
+  Only that leg could catch it, and the `not ok` line read like a flaky watcher
+  test.
+
+### Docs
+
+- `docs/ARCHITECTURE.md` gains the empty-answer path. It covered the machinery for a
+  response of 400 or worse and stopped there, so the 2xx that carries no text
+  had no home.
+- The bash 3.2 rule in `TESTING.md` was wrong twice over: stray parens break that
+  construct as well as stray quotes, and neither shape shows up at parse time,
+  so `bash -n` hands you a false all-clear.
+- The new-seat template in the provider-integration skill taught the bare `-z`
+  test and the unguarded `.error` read that no seat has any more.
+
+### Other
+
+- One jq helper serves both error reads in `openrouter.sh` instead of the
+  object-vs-string branch written out twice.
+
+## 2026.9.1
+
+### Features
+
+- **An OpenRouter seat.** `OPENROUTER_API_KEY` enlists an eleventh provider that
+  reaches any model on openrouter.ai, defaulting to `anthropic/claude-sonnet-5` —
+  the one vendor the council had no direct voice for. It sends exactly one model
+  id, never `models[]` or `route: "fallback"`: OpenRouter may fail over among
+  upstreams serving that same id, which preserves identity, but the council
+  labels, caches and synthesizes under the id it asked for, so a switch across
+  ids would silently mislabel the answer. `OPENROUTER_MODEL` retargets the seat;
+  `OPENROUTER_VISION=1` declares such an override image-capable, since the
+  curated default is the only routed model whose modalities are known here.
+
+  Three things this seat does not share with its five API siblings. Its errors
+  can arrive **inside an HTTP 200** — a body carrying `{"error":{"code":N}}` and
+  no `.choices`, where `jq -r '.choices[0].message.content'` prints the literal
+  `null` and exits 0, which would become a fabricated council vote — so it
+  classifies on `.error.code` before falling back to the wire status. It does not
+  use `is_model_unavailable_error`: that helper reads only the `.http_status`
+  stamped on a wire status >= 400, and maps 403 to exit 3, while OpenRouter
+  answers 403 for a moderation-flagged *prompt* that a fallback model would
+  refuse just as fast. And `/status` probes `/api/v1/key` rather than
+  `/api/v1/models`, which answers 200 with no key at all and with a rejected one
+  — an openai-shaped probe would have reported a dead seat as Connected.
+
+  Exit 3 — "a different model would help, and it is safe to remember that for 24
+  hours" — is reserved for a wrong model id. Verified against the live API rather
+  than assumed: an unknown slug comes back **400**, not 404, with the message
+  `<id> is not a valid model ID`, so the 400 class is admitted only when its
+  message names the model as invalid; an ordinary bad-parameter 400 is malformed
+  whichever model receives it and exits 1. 404 stays mapped for "No endpoints
+  found for <id>". 401 and 402 are key and wallet faults the fallback shares (402
+  says where to top up), and 429/5xx are transient, so none writes a day-long
+  verdict. No fallback model id ships: the repo requires each be verified against
+  the live API first, so the seat errors loudly today and degrades the day a
+  verified id lands.
+
+- **One router key can seat several models at once.** `OPENROUTER_MODELS` takes a
+  comma-separated list and each entry becomes its own council member —
+  `openrouter-1`, `openrouter-2`, `openrouter-3` — with its own header, model
+  label, cache entry, colour and role, all sharing the single key.
+  `--providers=openrouter-2` picks one out. The list replaces the single
+  `openrouter` seat rather than adding to it, so the same model never answers
+  twice under two headers.
+
+  The council's unit of identity is the seat, not the script, and this is the
+  first script that answers for more than one. Two pieces follow from that.
+  `provider_script_path` becomes the single definition of name -> script, since
+  there is no `openrouter-N.sh` for the numbered seats to resolve to. And the
+  orchestrator exports `COUNCIL_SEAT` so the script can resolve its own model
+  rather than the script default — without it every seat would post one model
+  while three headers each claimed a different one, with every hermetic test
+  green and `/status` reporting all three connected. A seat opts into images by
+  number (`OPENROUTER_2_VISION=1`): a roster can hold any model, and nothing in
+  an id says whether it reads images.
+
+- **`/status` prints real columns.** The layout used a literal tab, and a tab
+  stop lands at a different place depending on how long the preceding name is —
+  so `Grok` and `Perplexity` pushed their status to different columns. Each field
+  is now padded to a fixed width computed from the PLAIN text, since the painted
+  strings carry SGR escape bytes that occupy no width and would pad every row by
+  a different wrong amount. The last column carries the model when a provider is
+  connected and the remediation hint otherwise, so a failing row still says what
+  to do without widening every healthy row to make room for it. A test asserts
+  every row's status begins at the same column; it fails against the old tab.
+
+- **Roles can bind to a provider by name, not just by position.** `--roles` took
+  a bare list and zipped it against discovery order: role[i] to provider[i]. That
+  made adding a provider script shift every later provider's role by one, and
+  reordering `OPENROUTER_MODELS` reassign which router seat plays which part —
+  silently both times, because only non-empty roles are ever printed.
+  `--roles=openrouter-2=security,perplexity=devil` binds each role to the
+  provider it names and is immune to both. The bare form still works and is
+  still positional; the two cannot be mixed in one flag, since a bare entry
+  beside a keyed one has no unambiguous meaning. A pair naming a provider that
+  is not being queried is refused rather than ignored — a stale binding would
+  otherwise read as "nobody was given that role". And any provider left without
+  a role is now named on stderr instead of vanishing.
+
+  `validate_roles` had to admit the new shape or the flag would be refused
+  before the assigner ever saw it; it validates the role half of a pair exactly
+  as it validates a bare role, and leaves whether the provider exists to the
+  assigner, which is the only part that knows the roster.
+
+- **Agent-mode analysts run on a pinned model, not whatever the session uses.**
+  `--agents` spawns one Claude analyst per provider, and the workflow set no
+  model on those `agent()` calls — so they inherited the session's model, and the
+  cost of a mode that already fans out per provider swung by a factor of several
+  depending on what the user happened to be running. A measured eight-seat run on
+  Opus came to ~456k analyst tokens. The analyst's work is to run one query, judge
+  the reply and emit a structured object, so it now pins `sonnet`, overridable
+  with `COUNCIL_AGENT_MODEL` (`sonnet`/`opus`/`haiku`/`fable`, validated before
+  the run). Note this is the one `*_MODEL`-shaped variable that does not name a
+  model answering the question.
+
+- **`--list-default-models`, and an `/ask` picker that fits the roster.** The
+  provider picker built its options from a table written down in
+  `commands/ask.md`. That table had gone stale three times — it predated kimi,
+  ollama and the OpenRouter seats — and the shape it specified could not be
+  rendered anyway: AskUserQuestion allows four options per question, and a
+  roster of three routed models plus the usual seats needs nine. The one-line
+  note acknowledging the overflow named a fallback ("All / Fast subset /
+  Custom") that was never specified.
+
+  The new flag reports the default set as `<provider>\t<model>` per line, derived
+  from `default_provider_set` and `get_model` so it cannot name a provider a
+  query would not run or a model it would not send. `ask.md` now builds every
+  label from it rather than from a list, which removes the staleness as a class
+  rather than refreshing one instance, and specifies both shapes concretely: one
+  question when three or fewer providers are configured, grouped presets plus a
+  second multi-question call when more are. The model matters most for router
+  seats, which are named `openrouter-1`, `openrouter-2`, … and carry no model in
+  the name — without the pairing the picker shows identical-looking rows. The
+  command layer cannot resolve them itself: `ask.md`'s allowed-tools admits the
+  council's own scripts, not a shell that could source `providers.sh`.
+
+- **A whitespace-only answer is a failure, not an answer.** Every provider
+  guarded with `[[ -z "$TEXT" ]]`, which catches only a truly empty string, so a
+  model replying with a single space passed as a successful answer and reached
+  the synthesis weighted like any other vote. Found in a live debate round, where
+  one seat's rebuttal came back as one character and was recorded `success`. All
+  seven providers now use the whitespace-stripped test the suite's own
+  `assert_not_blank` has always used, and still say why on stderr so the council
+  stores a cause rather than an empty slot.
+
+- **Kimi reads images.** `kimi.sh` has built the OpenAI-shaped `image_url`
+  payload since it landed; only `provider_vision_capable` said otherwise, so the
+  council routed images away from a provider that could read them and `kimi-cli`,
+  whose only route to an image is through that sibling, answered text-only as a
+  consequence. Verified against the live model rather than the docs:
+  `moonshotai/kimi-k3` — the default — is text+image+video and correctly answers
+  a question posed only inside an image. `kimi-k2` and its variants really are
+  text-only while `k2.5` and later are not, so a `KIMI_MODEL` override opts in
+  with `KIMI_VISION=1`, mirroring the router's seat. `kimi-cli` stays out of the
+  capability table like every other CLI: a CLI cannot take an image, it reaches
+  one only by routing.
+
+- **Provider swatches are drawn, not looked up.** Every listing prefixed each
+  provider with an emoji square, and that could never line up: the U+1F7Ex family
+  holds seven colours and no black, and the two codepoints that fill the gaps —
+  U+2B1B and U+2B1C — render at text width in many terminal fonts, so they sat
+  narrower than their neighbours and knocked the provider column out of
+  alignment. `provider_emoji` is replaced by `provider_swatch`, which prints two
+  a circle in the provider's 24-bit colour. A circle is drawn to shape by the
+  font rather than inheriting the cell's roughly 1:2 aspect the way a block does,
+  so it stays round and occupies exactly one column for every provider, and its
+  palette is the RGB table rather than whichever squares Unicode happens to ship.
+
+  `provider_color_rgb` moves from `display.sh` to `providers.sh`, joining the
+  other provider-identity tables, so the header, the status listing and the
+  streaming pane read one definition instead of three that could drift.
+  `display.sh` sources it directly rather than assuming its caller did, keeping
+  the lib usable on its own. Ollama gains the arm it never had.
+
+  OpenRouter takes violet and Kimi the black it brands with, which is what
+  surfaced all of the above: the two had collided on purple. Kimi's name colour
+  is ANSI 90 rather than 30 — 30 is unreadable on a dark terminal, 90 is the grey
+  that renders a black brand on either background.
+
+  This uncovered a live defect: `provider_color` expands `${NAME:-}`, so a colour
+  its caller never defined degrades to no escape at all rather than failing —
+  and `query-council.sh` had never defined `MAGENTA`, so **Kimi had been
+  rendering uncoloured in every council run**. `MAGENTA` is now defined there,
+  and a test derives the required names from `provider_color` itself and asserts
+  both rendering callers define each one. Restating the list is what let it go
+  stale; the test reads the table instead.
+
+- **The synthesis is told a router seat is not a second opinion.** Pointing
+  `OPENROUTER_MODEL` at a model another seat already runs gives two headers
+  voicing one model, which nothing in the response reveals. `prompts/synthesis.md`
+  now reads such agreement as possible duplication rather than corroboration.
+
+### Fixes
+
+- **The prompt reaches jq off the process argv.** Every API provider staged the
+  prompt into a file and then handed it to jq with `--arg`, which puts it back on
+  the argv; Windows caps that near 32 KB. All six read it with `--rawfile` from
+  the file instead, so a `--file`-sized prompt never rides a command line.
+- **An unknown OpenRouter slug is a 400, not a 404.** Verified against the live
+  API. The wrong-model classifier admits the 400 class only when the message
+  names the model as invalid, so an ordinary bad-parameter 400 still exits 1.
+- **A whitespace-only answer is a failure.** A single space passed a bare `-z`
+  test and reached the synthesis as a real vote; all seven providers now strip
+  whitespace before the check and record a cause on stderr.
+- **Kimi reads images.** `kimi.sh` had always built the image payload; only the
+  capability table said otherwise, routing images away from a provider that
+  could read them, and taking `kimi-cli` with it.
+- **A malformed router seat name is refused.** `openrouter-0` aliased the last
+  roster model on newer bash and `openrouter-08` aborted the run outright; a seat
+  suffix that is not a plain positive number now answers `unknown`, and one
+  definition of "is this a seat" is shared by discovery, routing and the script.
+- **The reasoning-token bump covers what the router serves.** The OpenRouter
+  seat bumped only on `reasoning`/`thinking`; it now also covers `r1`, `deepseek`,
+  `qwen`, `gpt-oss` and the o-series, so a routed reasoning model no longer
+  truncates mid-answer and caches the fragment as a success.
+- **Naming a provider twice in `--roles` is refused**, the same as naming an
+  absent one, instead of silently taking the last binding.
+- **Each provider's cleanup trap precedes the temp files it removes.** A failure
+  mid-request no longer leaves the mode-600 curl config holding the bearer token,
+  or the prompt and content files, behind.
+- **A roster seat row keeps the remediation hint.** A missing key on an
+  `openrouter-N` row now shows `export OPENROUTER_API_KEY`, as the single-seat
+  row already did.
+
+### Internal
+
+- **Negated test assertions can fail.** Nineteen `! grep` checks sat mid-test,
+  where bash's errexit exemption means they can never fail the test; the
+  argv-secrecy checks that keep API keys off the process table were among them.
+  All are now `run !`.
+- **Six pane-watcher tests order against observable state, not a clock.** The
+  retry-offer, width-drag and close-prompt tests synchronised on hardcoded
+  sleeps; they now wait on renders, width readings and file markers.
+- **A simplify pass** gives "is this a router seat", the roster parse and the
+  model-unavailable wording one definition each, stages the prompt through one
+  shared helper in place of seven copies, and builds three providers' request
+  content on stdin rather than a temp file.
+
+## 2026.8.10
+
+### Features
+
+- **The test suite runs on Windows.** CI now runs all 556 bats tests on
+  `windows-latest` under Git Bash, alongside Ubuntu and macOS. TESTING.md
+  gains a Windows section: the ~22-minute budget, the CRLF-emitting jq
+  helper that reproduces the Windows build's stdout locally, MSYS's argv and
+  environment path rewriting, and why `@test` names stay ASCII.
+
+### Fixes
+
+- **A hung CLI provider is bounded on Windows.** `perl -e 'alarm shift; exec
+  @ARGV'` never ended the CLI there: perl emulates `exec` by spawning and
+  waiting, so the alarm killed perl and left codex/agy/grok/kimi running until
+  the CLI gave up on its own. `scripts/lib/deadline.sh` `run_with_deadline`
+  replaces it for the four CLI providers and the Rich probe. The watchdog
+  owns the verdict: a CLI that handles SIGTERM by exiting 0 with nothing on
+  stdout (the codex wrapper does) or by exiting 1 with `context canceled`
+  (agy does) is still reported as a timeout, not as an empty answer that
+  skips the API-sibling fallback; one that ignores the signal is killed
+  after five seconds, children first, so nothing it spawned holds the
+  answer pipe open. The watchdog is ended and reaped the moment the command
+  returns, so no sleeper outlives a fast call. A deadline of `0` means none;
+  a non-integer is rejected. The timeout status is 143 (was 142). Not
+  verified: whether ending a native CLI from Git Bash yields 143 on Windows
+  (the suite's fake CLIs are shell scripts), and Git Bash has no `pgrep`,
+  so only the CLI's own process is signalled there.
+- **`--debate` keeps round 2 on Windows.** The rebuttal envelope reached jq on
+  argv, past MSYS's ~32 KB ARG_MAX; jq failed and every debate lost its second
+  round. It goes through stdin now, like the round-1 blobs.
+- **The stop gate and `--cancel` read their own records on Windows.** jq's
+  Windows build CRLF-terminates piped stdout, and a `read < <(jq ... @tsv)`
+  keeps the `\r`: the gate read `max_iterations` as `1\r` (a bash arithmetic
+  error, then invalid JSON for the hook) and `run_cancel` read the pid as
+  `1234\r`, ending the worker but not its query tree. Both strip it.
+- **Background job records keep path values intact on Windows.** MSYS
+  rewrites POSIX-looking paths in argv and in environment values before a
+  native jq sees them, so an outfile of `/some/path.md` was stored as a
+  Windows path. `job_set` hands its value to jq on stdin.
+
+### Docs
+
+- ARCHITECTURE names the Windows runner and lists `deadline.sh`; README's
+  requirements name the supported platforms.
+
+### Other
+
+- 556 tests (was 543): `deadline.bats` pins `run_with_deadline` (stdin
+  passthrough, own status, 143 at the deadline whatever the command did with
+  the signal, SIGKILL escalation, no lingering watchdog or orphaned child,
+  nothing on stderr, `0` and non-integer deadlines);
+  CRLF-jq tests for the stop gate, `--cancel` and format-output. The
+  pane-watcher tests
+  run under `run_with_deadline` too, and eight test names are ASCII so bats
+  on MSYS can find them.
+
+**Full Changelog**: https://github.com/hex/claude-council/compare/v2026.8.9...v2026.8.10
+
+## 2026.8.9
+
+### Features
+
+- **`--agents` mode runs as one Workflow of analyst agents.** One analyst per
+  provider, in parallel, each returning its analysis through schema-enforced
+  structured output, so no reply passes through the orchestrator as text to be
+  pasted and validated. An interrupted run resumes with the finished analysts
+  served from cache. The question is written once to a run-scoped file and sent
+  with `--prompt-file`; role variants are built in shell. Needs a Claude Code
+  with the Workflow tool; a session without it is offered standard mode.
+- **Gemini's reasoning can be capped.** `GEMINI_THINKING_BUDGET` sets
+  `thinkingConfig.thinkingBudget`, keeping room for the visible answer when a
+  thinking model would otherwise spend the whole `maxOutputTokens` and return an
+  empty 200. Unset, the model decides. From #20 by @yp329, made opt-in here.
+
+### Fixes
+
+- **Gemini no longer renders as `null` on Windows.** jq's Windows build
+  CRLF-translates piped output, so the first provider key carried a stray `\r`
+  and `.round1["gemini\r"]` missed. `format-output.sh` strips it. #20, @yp329.
+- **Gemini answers are read whole.** Text split across parts, or preceded by a
+  thought-signature part, is joined instead of taking `parts[0]`; an empty 200
+  reports its `finishReason` and thinking spend instead of "Unknown error". #20.
+
+### Docs
+
+- README, ARCHITECTURE and the deep-execution skill describe the Workflow-based
+  agents mode; `validate-analysis.sh` is documented as the schema's executable
+  mirror for the test suite; the local council's Agent fan-out is recorded as a
+  decision.
+
+### Other
+
+- 543 tests (was 538): gemini's multi-part join, empty-200 diagnostics and the
+  opt-in thinking cap.
+
+**Full Changelog**: https://github.com/hex/claude-council/compare/v2026.8.8...v2026.8.9
+
 ## 2026.8.8
 
 ### Features

@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# ABOUTME: Hermetic coverage for the four API provider scripts — response
+# ABOUTME: Hermetic coverage for the six API provider scripts — response
 # ABOUTME: parsing, endpoint routing, error extraction, and secret/payload hygiene
 
 load test_helper
@@ -15,6 +15,7 @@ E2E_OPENAI_KEY="${OPENAI_API_KEY:-}"
 E2E_GROK_KEY="${XAI_API_KEY:-${GROK_API_KEY:-}}"
 E2E_PERPLEXITY_KEY="${PERPLEXITY_API_KEY:-}"
 E2E_KIMI_KEY="${KIMI_API_KEY:-${MOONSHOT_API_KEY:-}}"
+E2E_OPENROUTER_KEY="${OPENROUTER_API_KEY:-}"
 
 setup() {
     FAKE_DIR="${BATS_TEST_TMPDIR}/fakebin"
@@ -65,13 +66,271 @@ run_provider() {
         bash "$PROVIDERS/$script" "$prompt"
 }
 
+# ---- large prompts stay off jq's argv ----
+
+# The orchestrator hands every provider its prompt in a file precisely so a
+# large one never rides the process argv (MSYS caps it near 32KB). A provider
+# that then passes that prompt to jq with --arg puts it straight back. These
+# assert the invariant, not a failure: on a machine with a roomy ARG_MAX the
+# call succeeds either way, so only the recorded argv can tell the two apart.
+PROMPT_LEAK_MARK="ARGVLEAK_5b3d"
+
+# Write a prompt file far larger than MSYS's limit and echo its path.
+big_prompt_file() {
+    local f="${BATS_TEST_TMPDIR}/big-prompt"
+    { printf '%s ' "$PROMPT_LEAK_MARK"; head -c 40000 /dev/zero | tr '\0' 'z'; } > "$f"
+    printf '%s' "$f"
+}
+
+# Run a provider the way the orchestrator does — via --prompt-file — with jq
+# recording its argv. Usage: run_provider_with_prompt_file <script> [ENV=v ...]
+run_provider_with_prompt_file() {
+    local script="$1"; shift
+    local pfile; pfile=$(big_prompt_file)
+    install_recording_jq
+    run --separate-stderr env \
+        PATH="${JQ_BIN}:${FAKE_DIR}:$PATH" \
+        FAKE_ARGV_FILE="$ARGV_FILE" \
+        FAKE_CONFIG_FILE="$CONFIG_FILE" \
+        FAKE_DATA_FILE="$DATA_FILE" \
+        FAKE_BODY="$FAKE_BODY" \
+        FAKE_HTTP="${FAKE_HTTP:-200}" \
+        COUNCIL_RETRY_DELAY=0 \
+        "$@" \
+        bash "$PROVIDERS/$script" --prompt-file "$pfile"
+}
+
+@test "gemini: a large prompt never reaches jq's argv" {
+    FAKE_BODY='{"candidates":[{"content":{"parts":[{"text":"GEM_OK"}]}}]}'
+    run_provider_with_prompt_file gemini.sh GEMINI_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$output" = "GEM_OK" ]
+    # The prompt reached the request body...
+    grep -qF "$PROMPT_LEAK_MARK" "$DATA_FILE"
+    # ...without ever being an argument to jq.
+    ! grep -qF "$PROMPT_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "grok: a large prompt never reaches jq's argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"GROK_OK"}}]}'
+    run_provider_with_prompt_file grok.sh GROK_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$output" = "GROK_OK" ]
+    grep -qF "$PROMPT_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$PROMPT_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "openai: a large prompt never reaches jq's argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"OAI_OK"}}]}'
+    run_provider_with_prompt_file openai.sh OPENAI_API_KEY=k OPENAI_MODEL=gpt-4o
+    [ "$status" -eq 0 ]
+    [ "$output" = "OAI_OK" ]
+    grep -qF "$PROMPT_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$PROMPT_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "perplexity: a large prompt never reaches jq's argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"PPLX_OK"}}]}'
+    run_provider_with_prompt_file perplexity.sh PERPLEXITY_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$output" = "PPLX_OK" ]
+    grep -qF "$PROMPT_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$PROMPT_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "kimi: a large prompt never reaches jq's argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"KIMI_OK"}}]}'
+    run_provider_with_prompt_file kimi.sh KIMI_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$output" = "KIMI_OK" ]
+    grep -qF "$PROMPT_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$PROMPT_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "ollama: a large prompt never reaches jq's argv" {
+    # ollama gates on its binary rather than a key, and OLLAMA_MODEL skips the
+    # `ollama list` lookup, so a bare stub on PATH is enough to reach the payload.
+    printf '#!/bin/bash\nexit 0\n' > "$FAKE_DIR/ollama"
+    chmod +x "$FAKE_DIR/ollama"
+    FAKE_BODY='{"choices":[{"message":{"content":"OLL_OK"}}]}'
+    run_provider_with_prompt_file ollama.sh OLLAMA_MODEL=llama3
+    [ "$status" -eq 0 ]
+    [ "$output" = "OLL_OK" ]
+    grep -qF "$PROMPT_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$PROMPT_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
 # ---- response parsing (characterization) ----
+
+# ---- a blank answer is a failure, not an answer ----
+#
+# Found in a live debate round: deepseek returned a single space for its
+# rebuttal, the provider's `[[ -z "$TEXT" ]]` guard let it through, and the
+# council recorded status "success" with a one-character response — a silent
+# empty vote that synthesis weighs like any other. The suite's own
+# assert_not_blank has always used the whitespace-stripped test; the providers
+# did not.
+
+@test "every API provider treats a whitespace-only answer as a failure" {
+    local spec
+    for spec in "gemini.sh:GEMINI_API_KEY:{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"   \"}]}}]}" \
+                "openai.sh:OPENAI_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}" \
+                "grok.sh:GROK_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}" \
+                "perplexity.sh:PERPLEXITY_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}" \
+                "kimi.sh:KIMI_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}" \
+                "openrouter.sh:OPENROUTER_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}"; do
+        local script="${spec%%:*}" rest="${spec#*:}"
+        local keyvar="${rest%%:*}" body="${rest#*:}"
+        FAKE_BODY="$body" run_provider "$script" "hi" "${keyvar}=k" OPENAI_MODEL=gpt-4o
+        [ "$status" -eq 1 ] || { echo "$script exited $status on a blank answer"; return 1; }
+        # And it must say why, or the council stores an empty slot with no cause.
+        assert_not_blank "$stderr"
+    done
+}
+
+# ---- image base64 stays off jq's argv ----
+#
+# The prompt-leak tests above cover the prompt. The image is a second, larger
+# payload on the same path: query-council.sh base64-encodes it and hands the
+# provider a file, and a provider that then interpolates that file's contents
+# into a jq argument puts a megabyte on the command line. perplexity did exactly
+# that until this branch — it built the user-content array with --rawfile, then
+# passed the result on to the payload build with --argjson, which put the base64
+# back on argv one hop later. The image-injection tests could not see it: their
+# payload is four bytes.
+IMAGE_LEAK_MARK="B64LEAK_9f2a"
+
+# Write a base64 payload carrying the marker and echo its path. Size is
+# irrelevant to the assertion — the recorded argv answers the question on any
+# platform, whatever its ARG_MAX.
+big_image_file() {
+    local f="${BATS_TEST_TMPDIR}/big-b64"
+    { printf '%s' "$IMAGE_LEAK_MARK"; head -c 20000 /dev/zero | tr '\0' 'A'; } > "$f"
+    printf '%s' "$f"
+}
+
+# Usage: run_provider_with_image <script> [ENV=v ...]
+run_provider_with_image() {
+    local script="$1"; shift
+    local bf; bf=$(big_image_file)
+    install_recording_jq
+    run --separate-stderr env \
+        PATH="${JQ_BIN}:${FAKE_DIR}:$PATH" \
+        FAKE_ARGV_FILE="$ARGV_FILE" \
+        FAKE_CONFIG_FILE="$CONFIG_FILE" \
+        FAKE_DATA_FILE="$DATA_FILE" \
+        FAKE_BODY="$FAKE_BODY" \
+        FAKE_HTTP="${FAKE_HTTP:-200}" \
+        COUNCIL_RETRY_DELAY=0 \
+        "$@" \
+        bash "$PROVIDERS/$script" "describe this" --image-file "$bf" --image-mime image/png
+}
+
+@test "gemini: the image base64 never reaches jq's argv" {
+    FAKE_BODY='{"candidates":[{"content":{"parts":[{"text":"GEM_OK"}]}}]}'
+    run_provider_with_image gemini.sh GEMINI_API_KEY=k
+    [ "$status" -eq 0 ]
+    grep -qF "$IMAGE_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$IMAGE_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "openai: the image base64 never reaches jq's argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"OAI_OK"}}]}'
+    run_provider_with_image openai.sh OPENAI_API_KEY=k OPENAI_MODEL=gpt-4o
+    [ "$status" -eq 0 ]
+    grep -qF "$IMAGE_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$IMAGE_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "grok: the image base64 never reaches jq's argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"GROK_OK"}}]}'
+    run_provider_with_image grok.sh GROK_API_KEY=k
+    [ "$status" -eq 0 ]
+    grep -qF "$IMAGE_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$IMAGE_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "perplexity: the image base64 never reaches jq's argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"PPX_OK"}}]}'
+    run_provider_with_image perplexity.sh PERPLEXITY_API_KEY=k
+    [ "$status" -eq 0 ]
+    grep -qF "$IMAGE_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$IMAGE_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "perplexity: the image base64 stays off argv with a recency filter set" {
+    # The recency branch builds a second, separate payload; the two-hop leak was
+    # in the shared content build, but only one branch was ever exercised.
+    FAKE_BODY='{"choices":[{"message":{"content":"PPX_OK"}}]}'
+    run_provider_with_image perplexity.sh PERPLEXITY_API_KEY=k PERPLEXITY_RECENCY=week
+    [ "$status" -eq 0 ]
+    grep -qF "$IMAGE_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$IMAGE_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
+@test "openrouter: the image base64 never reaches jq's argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"OR_OK"}}]}'
+    run_provider_with_image openrouter.sh OPENROUTER_API_KEY=k
+    [ "$status" -eq 0 ]
+    grep -qF "$IMAGE_LEAK_MARK" "$DATA_FILE"
+    ! grep -qF "$IMAGE_LEAK_MARK" "$JQ_ARGV_FILE"
+}
 
 @test "gemini: extracts text from candidates path" {
     FAKE_BODY='{"candidates":[{"content":{"parts":[{"text":"GEM_OK"}]}}]}'
     run_provider gemini.sh "hi" GEMINI_API_KEY=k
     [ "$status" -eq 0 ]
     [ "$output" = "GEM_OK" ]
+}
+
+@test "gemini: joins every text part and skips thought parts" {
+    # A thinking model can put a thought-signature part before the answer, and
+    # split the answer across parts; parts[0].text alone would drop the answer.
+    FAKE_BODY='{"candidates":[{"content":{"parts":[{"thought":true,"thoughtSignature":"sig"},{"text":"GEM_"},{"text":"OK"}]}}]}'
+    run_provider gemini.sh "hi" GEMINI_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$output" = "GEM_OK" ]
+}
+
+@test "gemini: an empty 200 names the finish reason and the thinking spend" {
+    FAKE_BODY='{"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"thoughtsTokenCount":8000,"totalTokenCount":8192}}'
+    run_provider gemini.sh "hi" GEMINI_API_KEY=k
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"Error from Gemini: empty response (finishReason: MAX_TOKENS, thoughts tokens: 8000/8192)"* ]]
+}
+
+@test "gemini: a bare-string .error does not crash the extractor" {
+    # ensure_error_body passes a >=400 body with a usable message through
+    # untouched, so a bare-string .error reaches this jq as-is; indexing it
+    # with .message raises and kills the seat before it names anything.
+    FAKE_BODY='{"error":"upstream is down"}'
+    FAKE_HTTP=502 run_provider gemini.sh "hi" GEMINI_API_KEY=k COUNCIL_MAX_RETRIES=0
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"upstream is down"* ]]
+}
+
+@test "gemini: sends no thinking cap unless GEMINI_THINKING_BUDGET is set" {
+    # The model's own thinking policy is the default; a cap is a deliberate
+    # user choice, like COUNCIL_MAX_TOKENS.
+    FAKE_BODY='{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}'
+    run_provider gemini.sh "hi" GEMINI_API_KEY=k
+    [ "$status" -eq 0 ]
+    [[ "$(cat "$DATA_FILE")" != *thinkingConfig* ]]
+}
+
+@test "gemini: GEMINI_THINKING_BUDGET caps thinking in the request" {
+    FAKE_BODY='{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}'
+    run_provider gemini.sh "hi" GEMINI_API_KEY=k GEMINI_THINKING_BUDGET=4096
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.generationConfig.thinkingConfig.thinkingBudget' "$DATA_FILE")" = "4096" ]
+}
+
+@test "gemini: a non-numeric GEMINI_THINKING_BUDGET is refused before the request" {
+    FAKE_BODY='{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}'
+    run_provider gemini.sh "hi" GEMINI_API_KEY=k GEMINI_THINKING_BUDGET=lots
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"GEMINI_THINKING_BUDGET"* ]]
+    [ ! -s "$DATA_FILE" ]
 }
 
 @test "gemini: surfaces .error.message on a failure body" {
@@ -162,7 +421,7 @@ run_provider() {
     FAKE_BODY='{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}'
     run_provider gemini.sh "hi" GEMINI_API_KEY=SEKRET_GEMINI
     [ "$status" -eq 0 ]
-    ! grep -qF "SEKRET_GEMINI" "$ARGV_FILE"
+    run ! grep -qF "SEKRET_GEMINI" "$ARGV_FILE"
     grep -qF "SEKRET_GEMINI" "$CONFIG_FILE"
 }
 
@@ -170,7 +429,7 @@ run_provider() {
     FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
     run_provider openai.sh "hi" OPENAI_API_KEY=SEKRET_OAI OPENAI_MODEL=gpt-5.1
     [ "$status" -eq 0 ]
-    ! grep -qF "SEKRET_OAI" "$ARGV_FILE"
+    run ! grep -qF "SEKRET_OAI" "$ARGV_FILE"
     grep -qF "SEKRET_OAI" "$CONFIG_FILE"
 }
 
@@ -178,7 +437,7 @@ run_provider() {
     FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
     run_provider grok.sh "hi" XAI_API_KEY=SEKRET_GROK
     [ "$status" -eq 0 ]
-    ! grep -qF "SEKRET_GROK" "$ARGV_FILE"
+    run ! grep -qF "SEKRET_GROK" "$ARGV_FILE"
     grep -qF "SEKRET_GROK" "$CONFIG_FILE"
 }
 
@@ -186,7 +445,7 @@ run_provider() {
     FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
     run_provider perplexity.sh "hi" PERPLEXITY_API_KEY=SEKRET_PPX
     [ "$status" -eq 0 ]
-    ! grep -qF "SEKRET_PPX" "$ARGV_FILE"
+    run ! grep -qF "SEKRET_PPX" "$ARGV_FILE"
     grep -qF "SEKRET_PPX" "$CONFIG_FILE"
 }
 
@@ -194,7 +453,7 @@ run_provider() {
     FAKE_BODY='{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}'
     run_provider gemini.sh "UNIQUE_PROMPT_MARKER_42" GEMINI_API_KEY=k
     [ "$status" -eq 0 ]
-    ! grep -qF "UNIQUE_PROMPT_MARKER_42" "$ARGV_FILE"
+    run ! grep -qF "UNIQUE_PROMPT_MARKER_42" "$ARGV_FILE"
     grep -qF "UNIQUE_PROMPT_MARKER_42" "$DATA_FILE"
 }
 
@@ -278,13 +537,30 @@ run_provider() {
     grep -qF 'search_recency_filter' "$DATA_FILE"
 }
 
+@test "provider_vision_capable: kimi reads images on its default model" {
+    # kimi.sh has built the OpenAI-shaped image_url payload all along; only this
+    # table said otherwise, so the council routed images away from a provider
+    # that could read them — and kimi-cli, whose only route is through kimi,
+    # answered text-only as a consequence. Verified against the live model:
+    # moonshotai/kimi-k3 is text+image+video and answers questions posed in an
+    # image. kimi-k2 and its variants are text-only, hence the opt-in on override.
+    source "${LIB_DIR}/providers.sh"
+    provider_vision_capable kimi
+    # kimi-cli is a CLI: it cannot take an image, and reaches one only by
+    # routing to kimi. Claiming otherwise hands the base64 to a binary that
+    # has no argument for it.
+    run ! provider_vision_capable kimi-cli
+    KIMI_MODEL=kimi-k2 run ! provider_vision_capable kimi
+    KIMI_MODEL=kimi-k2 KIMI_VISION=1 provider_vision_capable kimi
+}
+
 @test "provider_vision_capable: true for gemini/openai/grok/perplexity, false for the rest" {
     source "${LIB_DIR}/providers.sh"
     provider_vision_capable gemini
     provider_vision_capable openai
     provider_vision_capable grok
     provider_vision_capable perplexity
-    ! provider_vision_capable codex
+    run ! provider_vision_capable codex
     ! provider_vision_capable antigravity
 }
 
@@ -380,7 +656,7 @@ run_provider() {
     FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
     run_provider kimi.sh "hi" KIMI_API_KEY=SEKRET_KIMI
     [ "$status" -eq 0 ]
-    ! grep -qF "SEKRET_KIMI" "$ARGV_FILE"
+    run ! grep -qF "SEKRET_KIMI" "$ARGV_FILE"
     grep -qF "SEKRET_KIMI" "$CONFIG_FILE"
 }
 
@@ -388,7 +664,7 @@ run_provider() {
     FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
     run_provider kimi.sh "UNIQUE_KIMI_MARKER_77" KIMI_API_KEY=k
     [ "$status" -eq 0 ]
-    ! grep -qF "UNIQUE_KIMI_MARKER_77" "$ARGV_FILE"
+    run ! grep -qF "UNIQUE_KIMI_MARKER_77" "$ARGV_FILE"
     grep -qF "UNIQUE_KIMI_MARKER_77" "$DATA_FILE"
 }
 
@@ -400,6 +676,318 @@ run_provider() {
     FAKE_BODY='{"error":{"message":"invalid api key"}}'
     FAKE_HTTP=401 run_provider kimi.sh "hi" KIMI_API_KEY=k
     [ "$status" -eq 1 ]
+}
+
+# ---- openrouter ----
+#
+# OpenRouter is the one seat whose errors can arrive with HTTP 200: the body
+# carries {"error":{"code":N}} and no .choices. ensure_error_body stamps
+# .http_status only on a wire status >= 400 (retry.sh:51), so on that path
+# is_model_unavailable_error is structurally blind — hence this seat classifies
+# on .error.code first, falling back to .http_status.
+
+@test "openrouter: a 404 carried inside an HTTP 200 exits 3" {
+    FAKE_BODY='{"error":{"code":404,"message":"No endpoints found for anthropic/claude-sonnet-4.6."}}'
+    FAKE_HTTP=200 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 3 ]
+    assert_not_blank "$stderr"
+}
+
+@test "openrouter: a wire 404 exits 3, and 401 does not" {
+    FAKE_BODY='{"error":{"message":"No endpoints found for anthropic/claude-sonnet-5."}}'
+    FAKE_HTTP=404 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 3 ]
+
+    # The key, not the model, is the fault; the fallback model shares the key.
+    FAKE_BODY='{"error":{"code":401,"message":"User not found."}}'
+    FAKE_HTTP=401 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+}
+
+@test "openrouter: a non-numeric error code does not shadow the wire status" {
+    # `//` in jq falls through on null, not on a non-empty string, so a passthrough
+    # code like "model_not_found" would hide the 404 that ensure_error_body stamped
+    # and cost the run its one durable wrong-slug signal.
+    FAKE_BODY='{"error":{"code":"model_not_found","message":"anthropic/nope is not a valid model id"}}'
+    FAKE_HTTP=404 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 3 ]
+}
+
+@test "openrouter: an upstream's own wrong-model wording exits 3 like the router's" {
+    # The router passes some upstream 400s through in the vendor's words, and
+    # the phrasing list is the one is_model_unavailable_error uses, so a wording
+    # that earns exit 3 on a direct seat earns it here.
+    FAKE_BODY='{"error":{"message":"The model `openai/gpt-nope` does not exist or you do not have access to it.","code":400}}'
+    FAKE_HTTP=400 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 3 ]
+}
+
+@test "openrouter: the 400 that names an invalid model id exits 3" {
+    # Verified against the live API: an unknown slug comes back 400, not the 404
+    # the design assumed, with .error.code 400 and the wire status agreeing.
+    FAKE_BODY='{"error":{"message":"anthropic/claude-sonnet-does-not-exist-99 is not a valid model ID","code":400},"user_id":"user_x"}'
+    FAKE_HTTP=400 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 3 ]
+}
+
+@test "openrouter: an ordinary 400 is not a model verdict" {
+    # 400 also covers plain bad parameters. Treating the whole class as
+    # model-unavailable would spend a fallback call on a request that is
+    # malformed whichever model receives it.
+    FAKE_BODY='{"error":{"message":"max_tokens must be at least 1","code":400}}'
+    FAKE_HTTP=400 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+}
+
+@test "openrouter: a 403 moderation block exits 1, not 3" {
+    # OpenRouter answers 403 for a prompt its moderation flagged — a property of
+    # the input, not the model. is_model_unavailable_error maps a wire 403 to
+    # exit 3 (retry.sh:151), which would spend a fallback call re-sending the
+    # same flagged prompt.
+    FAKE_BODY='{"error":{"code":403,"message":"Input flagged by moderation.","metadata":{"reasons":["harassment"]}}}'
+    FAKE_HTTP=403 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"moderation"* ]]
+}
+
+@test "openrouter: an exhausted balance exits 1 and names where to top up" {
+    # The fallback model draws on the same wallet, so a different model cannot
+    # help; the user has to act, which means the message has to say what to do.
+    FAKE_BODY='{"error":{"code":402,"message":"Insufficient credits."}}'
+    FAKE_HTTP=402 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"openrouter.ai/credits"* ]]
+}
+
+@test "openrouter: transient failures exit 1 so no 24h verdict is recorded" {
+    local code
+    for code in 429 500 502 503 504; do
+        FAKE_BODY="{\"error\":{\"code\":${code},\"message\":\"transient\"}}"
+        FAKE_HTTP=$code run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k COUNCIL_MAX_RETRIES=0
+        [ "$status" -eq 1 ]
+    done
+}
+
+@test "openrouter: a 200 whose content is null is an error, not an answer" {
+    # jq -r on a missing .choices prints the literal "null" and exits 0, so
+    # without the // empty guard this body becomes a fabricated council vote.
+    FAKE_BODY='{"id":"gen-1","choices":[{"message":{"content":null}}]}'
+    FAKE_HTTP=200 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+    [[ "$output" != *"null"* ]]
+    assert_not_blank "$stderr"
+}
+
+@test "openrouter: a bare-string .error does not crash the extractor" {
+    FAKE_BODY='{"error":"upstream is down"}'
+    FAKE_HTTP=502 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k COUNCIL_MAX_RETRIES=0
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"upstream is down"* ]]
+}
+
+@test "openrouter: a mid-generation provider error on the choice is named" {
+    # Documented shape: an error after the model has begun producing output
+    # comes back HTTP 200 with the error on the choice, not at the top level,
+    # so the top-level read alone sees an empty answer and no error.
+    FAKE_BODY='{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"error","error":{"code":502,"message":"Provider disconnected mid-stream"}}]}'
+    FAKE_HTTP=200 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"Provider disconnected mid-stream"* ]]
+    [[ "$stderr" != *"Unknown error"* ]]
+}
+
+@test "openrouter: a bare-string error on the choice does not crash the extractor" {
+    # The documented choice-level error is an object, but the top-level one is
+    # a bare string for some upstreams; indexing a string raises in jq, which
+    # under pipefail would kill the script before it printed anything at all.
+    FAKE_BODY='{"choices":[{"message":{"content":""},"error":"upstream disconnected"}]}'
+    FAKE_HTTP=200 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"upstream disconnected"* ]]
+}
+
+@test "openrouter: an empty 200 names the finish reason and the reasoning spend" {
+    # A routed reasoning model that spends its whole budget thinking answers
+    # 200 with empty content and no error at all; "Unknown error" hides which
+    # of the three empty-answer causes it was.
+    FAKE_BODY='{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}],"usage":{"completion_tokens":2048,"completion_tokens_details":{"reasoning_tokens":2048}}}'
+    FAKE_HTTP=200 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"finish_reason: length"* ]]
+    [[ "$stderr" == *"reasoning tokens: 2048/2048"* ]]
+}
+
+@test "openrouter: an answer left in the reasoning field is reported by its size" {
+    # An upstream that returns the answer only as reasoning stops cleanly with
+    # empty content — indistinguishable from a truncation unless the reasoning
+    # length is reported.
+    FAKE_BODY='{"choices":[{"message":{"role":"assistant","content":"","reasoning":"the answer"},"finish_reason":"stop"}]}'
+    FAKE_HTTP=200 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"finish_reason: stop"* ]]
+    [[ "$stderr" == *"reasoning chars: 10"* ]]
+}
+
+@test "openrouter: a scalar choices[0] does not crash the extractor" {
+    # Indexing a string raises in jq and kills the seat under pipefail before
+    # any error line is printed, which is the failure this branch exists to
+    # prevent. No known producer sends this shape; the guard is robustness.
+    FAKE_BODY='{"choices":["hi"]}'
+    FAKE_HTTP=200 run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 1 ]
+    assert_not_blank "$stderr"
+}
+
+@test "openrouter: missing key fails before any request" {
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider openrouter.sh "hi"
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"OPENROUTER_API_KEY"* ]]
+    [ ! -s "$ARGV_FILE" ]
+}
+
+@test "openrouter: extracts content and posts the pinned default to the router" {
+    FAKE_BODY='{"choices":[{"message":{"content":"OR_OK"}}],"model":"anthropic/claude-sonnet-5"}'
+    run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$output" = "OR_OK" ]
+    grep -qF "https://openrouter.ai/api/v1/chat/completions" "$ARGV_FILE"
+    [[ "$(jq -r '.model' "$DATA_FILE")" == "anthropic/claude-sonnet-5" ]]
+}
+
+@test "openrouter: a numbered seat posts its own roster model, not the default" {
+    # The orchestrator resolves openrouter-2 to this same script, so without
+    # COUNCIL_SEAT every seat would post the default while three headers claimed
+    # three different models — every hermetic test green, every label a lie.
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k \
+        OPENROUTER_MODELS=deepseek/deepseek-v3.2,z-ai/glm-5.3,qwen/qwen3-max \
+        COUNCIL_SEAT=openrouter-2
+    [ "$status" -eq 0 ]
+    [[ "$(jq -r '.model' "$DATA_FILE")" == "z-ai/glm-5.3" ]]
+}
+
+@test "openrouter: a COUNCIL_SEAT naming another provider cannot retarget this one" {
+    # COUNCIL_SEAT is orchestrator state. A stale value left in a user's shell
+    # must not decide which model the single seat queries.
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k COUNCIL_SEAT=gemini
+    [ "$status" -eq 0 ]
+    [[ "$(jq -r '.model' "$DATA_FILE")" == "anthropic/claude-sonnet-5" ]]
+}
+
+@test "openrouter: sends one model id and never asks the router to switch models" {
+    # models[] or route:"fallback" let OpenRouter answer as a different model
+    # than the one the council labels, caches and synthesizes under.
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 0 ]
+    [[ "$(jq -r '.model | type' "$DATA_FILE")" == "string" ]]
+    [[ "$(jq -r 'has("models")' "$DATA_FILE")" == "false" ]]
+    [[ "$(jq -r 'has("route")' "$DATA_FILE")" == "false" ]]
+}
+
+@test "openrouter: the routed model is logged to stderr only under debug" {
+    # run_provider_script merges provider stderr into stdout and stores the whole
+    # capture as the answer, so anything written here on the success path is
+    # cached and fed to synthesis as if the model had said it.
+    FAKE_BODY='{"choices":[{"message":{"content":"OR_OK"}}],"model":"anthropic/claude-sonnet-5-20260115","provider":"Anthropic"}'
+    run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$output" = "OR_OK" ]
+    assert_blank "$stderr"
+
+    run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k COUNCIL_DEBUG=1
+    [ "$status" -eq 0 ]
+    [ "$output" = "OR_OK" ]
+    [[ "$stderr" == *"anthropic/claude-sonnet-5-20260115"* ]]
+}
+
+@test "openrouter: a routed reasoning model earns the token bump" {
+    # The router is the one provider designed to be retargeted at an arbitrary
+    # id, so the bump keys off the id's shape. A reasoning model shares the cap
+    # between hidden thinking and the visible answer, and nothing here reads
+    # finish_reason: at the 2048 base the answer truncates mid-sentence and the
+    # fragment is cached and synthesized as a normal success.
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    local model
+    for model in deepseek/deepseek-r1 openai/o3-mini qwen/qwen3-max \
+                 google/gemini-3-thinking x-ai/grok-4-reasoning; do
+        # The fake curl appends, so each model needs the payload file to itself.
+        : > "$DATA_FILE"
+        run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k "OPENROUTER_MODEL=$model"
+        [ "$status" -eq 0 ]
+        echo "model=$model max_tokens=$(jq -r '.max_tokens' "$DATA_FILE")"
+        [ "$(jq -r '.max_tokens' "$DATA_FILE")" -ge 32768 ]
+    done
+}
+
+@test "openrouter: an ordinary model keeps the plain cap" {
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k \
+        OPENROUTER_MODEL=anthropic/claude-sonnet-5
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.max_tokens' "$DATA_FILE")" -eq 2048 ]
+}
+
+@test "openrouter: bearer key never appears in the process argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider openrouter.sh "hi" OPENROUTER_API_KEY=SEKRET_ORT
+    run ! grep -qF "SEKRET_ORT" "$ARGV_FILE"
+    grep -qF "SEKRET_ORT" "$CONFIG_FILE"
+}
+
+@test "openrouter: a stale COUNCIL_SEAT the roster cannot have leaves the default model" {
+    # COUNCIL_SEAT is orchestrator state. A value left in a user's shell that is
+    # not a seat this script can be must not reach the model lookup: openrouter-0
+    # asks the roster for position -1, and a leading zero is not a number bash
+    # will read as one.
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    local seat
+    for seat in openrouter-0 openrouter-08 openrouter-1x; do
+        # The fake curl appends, so each seat needs the payload file to itself.
+        : > "$DATA_FILE"
+        run_provider openrouter.sh "hi" OPENROUTER_API_KEY=k \
+            "OPENROUTER_MODELS=vendor/one,vendor/two,vendor/three" \
+            "COUNCIL_SEAT=$seat"
+        [ "$status" -eq 0 ]
+        assert_blank "$stderr"
+        echo "seat=$seat sent model=$(jq -r '.model' "$DATA_FILE")"
+        [[ "$(jq -r '.model' "$DATA_FILE")" == 'anthropic/claude-sonnet-5' ]]
+    done
+}
+
+@test "openrouter: injects image_url object when given an image" {
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    local bf="${BATS_TEST_TMPDIR}/b64"; printf 'QUJD' > "$bf"
+    run --separate-stderr env PATH="${FAKE_DIR}:$PATH" \
+        FAKE_ARGV_FILE="$ARGV_FILE" FAKE_CONFIG_FILE="$CONFIG_FILE" \
+        FAKE_DATA_FILE="$DATA_FILE" FAKE_BODY="$FAKE_BODY" OPENROUTER_API_KEY=k \
+        bash "$PROVIDERS/openrouter.sh" "hi" --image-file "$bf" --image-mime image/png
+    [ "$status" -eq 0 ]
+    grep -qF 'image_url' "$DATA_FILE"
+    grep -qF 'data:image/png;base64,QUJD' "$DATA_FILE"
+}
+
+@test "openrouter: a large prompt never reaches jq's argv, model id intact" {
+    # The id carries a slash and a leading tilde, the two shapes MSYS rewrites in
+    # argv and env, so the Windows CI leg proves the model reaches the payload
+    # unmangled rather than only that the prompt stayed off argv.
+    FAKE_BODY='{"choices":[{"message":{"content":"OR_OK"}}]}'
+    run_provider_with_prompt_file openrouter.sh OPENROUTER_API_KEY=k \
+        'OPENROUTER_MODEL=~anthropic/claude-sonnet-latest'
+    [ "$status" -eq 0 ]
+    [ "$output" = "OR_OK" ]
+    grep -qF "$PROMPT_LEAK_MARK" "$DATA_FILE"
+    run ! grep -qF "$PROMPT_LEAK_MARK" "$JQ_ARGV_FILE"
+    [[ "$(jq -r '.model' "$DATA_FILE")" == '~anthropic/claude-sonnet-latest' ]]
+}
+
+@test "provider_vision_capable: openrouter is capable by default, an override opts in" {
+    source "${LIB_DIR}/providers.sh"
+    provider_vision_capable openrouter
+    OPENROUTER_MODEL=deepseek/deepseek-v3 run ! provider_vision_capable openrouter
+    OPENROUTER_MODEL=deepseek/deepseek-v3 OPENROUTER_VISION=1 provider_vision_capable openrouter
 }
 
 @test "kimi: sends the only temperature its models accept" {
@@ -471,6 +1059,16 @@ run_e2e() {
 @test "kimi: the live endpoint accepts our payload, temperature included (E2E)" {
     e2e_gate "$E2E_KIMI_KEY"
     run_e2e kimi.sh KIMI_API_KEY "$E2E_KIMI_KEY"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"OK"* ]]
+}
+
+# The hermetic tests above assert what this seat sends. Only a real call can
+# assert the router accepts it — and that the pinned default id still resolves,
+# which a catalog listing alone does not prove.
+@test "openrouter: the live endpoint accepts our payload (E2E)" {
+    e2e_gate "$E2E_OPENROUTER_KEY"
+    run_e2e openrouter.sh OPENROUTER_API_KEY "$E2E_OPENROUTER_KEY"
     [ "$status" -eq 0 ]
     [[ "$output" == *"OK"* ]]
 }

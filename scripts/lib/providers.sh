@@ -30,6 +30,23 @@ discover_providers() {
             ollama)
                 command -v ollama >/dev/null 2>&1 && is_available=true
                 ;;
+            openrouter)
+                # The one script that can seat more than once. With a roster set,
+                # it enlists as openrouter-1..N instead of itself, so each model
+                # gets its own header, cache key and role; without one it behaves
+                # like any other API seat.
+                if api_key_present openrouter; then
+                    local seats=() i
+                    openrouter_seat_models seats
+                    if (( ${#seats[@]} > 0 )); then
+                        for ((i = 1; i <= ${#seats[@]}; i++)); do
+                            available+=("openrouter-$i")
+                        done
+                        continue
+                    fi
+                    is_available=true
+                fi
+                ;;
             *)
                 # API providers gate on <NAME>_API_KEY — the same check
                 # api_key_present makes, so there's one definition of it.
@@ -141,6 +158,43 @@ parse_provider_list() {
     local parsed
     read -ra parsed <<< "${1//,/ }"
     echo "${parsed[*]+"${parsed[*]}"}"
+}
+
+# Fills the array named by $1 with the roster's model ids, in list order — the
+# entries of OPENROUTER_MODELS split the way parse_provider_list splits, without
+# a fork. An unset or empty roster fills nothing.
+# Empty when OPENROUTER_MODELS is unset — which leaves the single `openrouter`
+# seat in place, unchanged.
+#
+# A router can front many models at once, but the council's unit of identity is
+# the seat: one header, one model label, one cache key, one role. So a roster of
+# N models is N seats rather than one seat that varies, and `openrouter-N` names
+# the Nth. There is no openrouter-N.sh — provider_script_path routes them all
+# back to the one script, which reads COUNCIL_SEAT to learn which it is.
+openrouter_seat_models() {
+    local __roster="${OPENROUTER_MODELS:-}"
+    read -ra "$1" <<< "${__roster//,/ }"
+}
+
+# The roster position a router seat name carries: prints N and returns 0 for
+# openrouter-N with N a plain positive number, returns 1 for any other name.
+# The one definition, because the number reaches array arithmetic and a glob
+# alone admits shapes that are not positions: openrouter-0 would index -1,
+# which is the LAST entry on bash 4.3+, and bash reads a leading zero as octal
+# and aborts the run outright.
+router_seat_index() {
+    [[ "$1" =~ ^openrouter-([1-9][0-9]*)$ ]] || return 1
+    echo "${BASH_REMATCH[1]}"
+}
+
+# The script that answers for a provider name. Every name is its own filename
+# except the router's numbered seats, which share openrouter.sh.
+provider_script_path() {
+    if router_seat_index "$1" >/dev/null; then
+        echo "${PROVIDERS_DIR}/openrouter.sh"
+    else
+        echo "${PROVIDERS_DIR}/$1.sh"
+    fi
 }
 
 # Reads one bare key from a TOML file — the root table when $2 is empty, the
@@ -258,6 +312,30 @@ get_model() {
         kimi)       echo "${KIMI_MODEL:-kimi-k3}" ;;
         kimi-cli)   cli_model kimi-cli "${KIMI_CLI_MODEL:-}" ;;
         ollama)     echo "${OLLAMA_MODEL:-local}" ;;
+        # Pinned rather than an alias for the reason stated above, and pinned to
+        # an Anthropic id because that is the one vendor the council otherwise
+        # has no voice for. A router's default is retargetable by design:
+        # OPENROUTER_MODEL takes any id from openrouter.ai/models.
+        openrouter) echo "${OPENROUTER_MODEL:-anthropic/claude-sonnet-5}" ;;
+        openrouter-[0-9]*)
+            # An explicit <PREFIX>_MODEL wins, exactly as it does for every other
+            # provider: the exit-3 degrade path forces a fallback that way, and a
+            # roster entry must not send the model that just failed.
+            local __ovr __models __seat
+            # A name that is not a roster position answers like a seat past the
+            # end rather than reaching the arithmetic.
+            __seat=$(router_seat_index "$1") || { echo "unknown"; return; }
+            __ovr="$(provider_env_prefix "$1")_MODEL"
+            if [[ -n "${!__ovr:-}" ]]; then
+                echo "${!__ovr}"
+            else
+                __models=()
+                openrouter_seat_models __models
+                # A seat past the end of the roster reports "unknown" rather than
+                # a neighbour's id, so a mislabelled answer is impossible.
+                echo "${__models[$(( __seat - 1 ))]:-unknown}"
+            fi
+            ;;
         *)          echo "unknown" ;;
     esac
 }
@@ -267,6 +345,28 @@ get_model() {
 provider_vision_capable() {
     case "$1" in
         gemini|openai|grok|perplexity) return 0 ;;
+        # kimi.sh builds the image payload already; the default model reads it.
+        # An override may not — kimi-k2 and its variants are text-only while
+        # k2.5 and later are not — so an override opts in the same way the
+        # router's does. kimi-cli is deliberately absent, like every other CLI:
+        # a CLI cannot take an image, it reaches one only by routing here.
+        # The router's curated default accepts images too, and an override
+        # points at any of hundreds of routed models whose modalities are not
+        # knowable from here, so both opt in the same way: the default is
+        # capable, an override says so with <PREFIX>_VISION=1.
+        kimi|openrouter)
+            local __p __m __v
+            __p="$(provider_env_prefix "$1")"; __m="${__p}_MODEL"; __v="${__p}_VISION"
+            [[ -z "${!__m:-}" || "${!__v:-}" == 1 ]]
+            ;;
+        openrouter-[0-9]*)
+            # A roster entry is whichever id the user listed, so nothing here can
+            # know its modalities. Each seat opts in on its own — collectively
+            # would route an image to the two seats that cannot read it.
+            local __vis
+            __vis="$(provider_env_prefix "$1")_VISION"
+            [[ "${!__vis:-}" == 1 ]]
+            ;;
         *) return 1 ;;
     esac
 }
@@ -298,7 +398,7 @@ coerce_result_json() {
 # Vendor color for a provider name. CLI variants share their vendor's color
 # (codex with openai, antigravity with gemini, grok-cli with grok) since they
 # speak for the same vendor.
-# Callers define BLUE/WHITE/RED/GREEN/MAGENTA/CYAN; the expansions below
+# Callers define BLUE/WHITE/RED/GREEN/MAGENTA/CYAN/BRIGHT_BLACK; the expansions below
 # default to empty so a provider that no arm names cannot abort the caller
 # under `set -u` (check-status.sh defines no CYAN, so the default arm used to
 # kill the whole status run the moment any new provider was added).
@@ -308,21 +408,45 @@ provider_color() {
         openai|codex)      echo -e "${WHITE:-}" ;;
         grok|grok-cli)     echo -e "${RED:-}" ;;
         perplexity)        echo -e "${GREEN:-}" ;;
-        kimi|kimi-cli)     echo -e "${MAGENTA:-}" ;;
+        kimi|kimi-cli)     echo -e "${BRIGHT_BLACK:-}" ;;
         ollama)            echo -e "${CYAN:-}" ;;
+        openrouter|openrouter-[0-9]*) echo -e "${MAGENTA:-}" ;;
         *)                 echo -e "${CYAN:-}" ;;
     esac
 }
 
-# Vendor emoji for a provider name. Same grouping as provider_color.
-provider_emoji() {
-    case "$1" in
-        gemini|antigravity) echo "🟦" ;;
-        openai|codex)      echo "🔳" ;;
-        grok|grok-cli)     echo "🟥" ;;
-        perplexity)        echo "🟩" ;;
-        kimi|kimi-cli)     echo "🟪" ;;
-        ollama)            echo "⬜" ;;
-        *)                 echo "⬛" ;;
+# Vendor RGB triplet for a provider name, as a 24-bit foreground colour over the
+# user's unknown terminal background — mid-tone shades readable on light and
+# dark themes. Writes the triplet into the variable named by $1 (printf -v avoids
+# a subshell). Same grouping as provider_color: CLI variants speak for the same
+# vendor as their API sibling.
+provider_color_rgb() {
+    local __out="$1"
+    case "$2" in
+        gemini|antigravity) printf -v "$__out" '59;130;246'   ;;  # blue-500
+        openai|codex)      printf -v "$__out" '100;116;139'  ;;  # slate-500
+        grok|grok-cli)     printf -v "$__out" '239;68;68'    ;;  # red-500
+        perplexity)        printf -v "$__out" '22;163;74'    ;;  # green-600
+        kimi|kimi-cli)     printf -v "$__out" '63;63;70'     ;;  # zinc-700
+        ollama)            printf -v "$__out" '8;145;178'    ;;  # cyan-600
+        openrouter|openrouter-[0-9]*) printf -v "$__out" '124;58;237' ;;  # violet-600
+        *)                 printf -v "$__out" '113;113;122'  ;;  # zinc-500
     esac
+}
+
+# The provider's colour swatch that precedes its name in every listing: one
+# circle in the provider's own colour.
+#
+# Two earlier shapes did not survive contact with real terminals. Emoji squares
+# come in seven colours with no black, and the two codepoints that fill the gaps
+# (U+2B1B, U+2B1C) render at text width in many fonts, so they sat narrower than
+# their neighbours and broke the column. Drawn blocks fixed the width but
+# inherited the cell's roughly 1:2 aspect, reading as a tall bar rather than a
+# chip. A circle is drawn to shape by the font, so it is round at any cell
+# aspect, occupies exactly one column for every provider, and takes its colour
+# from the RGB table above rather than from whichever squares Unicode ships.
+provider_swatch() {
+    local __rgb
+    provider_color_rgb __rgb "$1"
+    printf '\033[38;2;%sm●\033[0m' "$__rgb"
 }

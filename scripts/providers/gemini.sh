@@ -20,9 +20,13 @@ PROMPT="${1:-}"
 IMAGE_FILE=""
 IMAGE_MIME=""
 # A large prompt (e.g. a big --file) arrives via a temp file to stay off the
-# process argv, where the OS would reject it as "argument list too long".
+# process argv, where the OS would reject it as "argument list too long". The
+# path is kept, not just the text: jq reads the prompt with --rawfile so it
+# stays off jq's argv too, which is bounded by the same limit.
+PROMPT_FILE=""
 if [[ "$PROMPT" == "--prompt-file" ]]; then
-    PROMPT=$(cat "${2:?--prompt-file requires a path}")
+    PROMPT_FILE="${2:?--prompt-file requires a path}"
+    PROMPT=""
     shift 2
 elif [[ $# -gt 0 ]]; then
     shift
@@ -35,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$PROMPT" ]]; then
+if [[ -z "$PROMPT" && ! -s "$PROMPT_FILE" ]]; then
     echo "Error: No prompt provided" >&2
     exit 1
 fi
@@ -64,22 +68,48 @@ bump_for_reasoning TOKENS "$MODEL" "$BASE_TOKENS" 'gemini-3*' '*thinking*' 'gemi
 
 SYSTEM="${VERBOSITY_PREFIX:+$VERBOSITY_PREFIX }$BASE_SYSTEM_PROMPT"
 
+# Optional cap on the model's internal "thinking" tokens. Unset, the model
+# decides how much to reason (and bump_for_reasoning above keeps the answer
+# budget large). Set, it guarantees room for the visible answer when a reasoning
+# model would otherwise spend the whole maxOutputTokens allowance on invisible
+# chain-of-thought and return an empty 200 — and it cuts the tail latency that
+# causes request timeouts. A deliberate user setting, like COUNCIL_MAX_TOKENS,
+# so no default is imposed. Validated here: an unbound or malformed value must
+# fail loudly, not vanish into a jq error (see tests/test_helper.bash on 3.2).
+THINKING_BUDGET="${GEMINI_THINKING_BUDGET:-}"
+if [[ -n "$THINKING_BUDGET" && ! "$THINKING_BUDGET" =~ ^[0-9]+$ ]]; then
+    echo "Error: GEMINI_THINKING_BUDGET must be a whole number of tokens, got '${THINKING_BUDGET}'" >&2
+    exit 1
+fi
+
+# One trap for every temp file this script owns, installed before the first of
+# them exists and naming them all: a failure between here and the request —
+# a jq that cannot read the image file, say — would otherwise leave the prompt
+# file behind, and an EXIT trap that expands a name not yet assigned ends where
+# it stands under set -u without removing anything.
+CURL_CFG="" PAYLOAD_FILE="" OWNED_PROMPT_FILE=""
+trap 'rm -f "$CURL_CFG" "$PAYLOAD_FILE" "$OWNED_PROMPT_FILE"' EXIT
+
+stage_prompt_file
+
 # Build request payload
 if [[ -n "$IMAGE_FILE" ]]; then
-    PAYLOAD=$(jq -n --arg prompt "$PROMPT" --argjson tokens "$TOKENS" --arg system "$SYSTEM" \
-        --rawfile b64 "$IMAGE_FILE" --arg mime "$IMAGE_MIME" '{
+    PAYLOAD=$(jq -n --rawfile prompt "$PROMPT_FILE" --argjson tokens "$TOKENS" --arg system "$SYSTEM" \
+        --rawfile b64 "$IMAGE_FILE" --arg mime "$IMAGE_MIME" --argjson thinking "${THINKING_BUDGET:-null}" '{
         system_instruction: { parts: [{ text: $system }] },
         contents: [{ parts: [
             { text: $prompt },
             { inlineData: { mimeType: $mime, data: $b64 } }
         ]}],
-        generationConfig: { temperature: 0.7, maxOutputTokens: $tokens }
+        generationConfig: ({ temperature: 0.7, maxOutputTokens: $tokens }
+            + (if $thinking == null then {} else { thinkingConfig: { thinkingBudget: $thinking } } end))
     }')
 else
-    PAYLOAD=$(jq -n --arg prompt "$PROMPT" --argjson tokens "$TOKENS" --arg system "$SYSTEM" '{
+    PAYLOAD=$(jq -n --rawfile prompt "$PROMPT_FILE" --argjson tokens "$TOKENS" --arg system "$SYSTEM" --argjson thinking "${THINKING_BUDGET:-null}" '{
         system_instruction: { parts: [{ text: $system }] },
         contents: [{ parts: [{ text: $prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: $tokens }
+        generationConfig: ({ temperature: 0.7, maxOutputTokens: $tokens }
+            + (if $thinking == null then {} else { thinkingConfig: { thinkingBudget: $thinking } } end))
     }')
 fi
 
@@ -88,7 +118,6 @@ fi
 # mode-600 curl config file (x-goog-api-key header) and the payload via a file.
 CURL_CFG=$(curl_secret_config "x-goog-api-key: ${API_KEY}")
 PAYLOAD_FILE=$(mktemp)
-trap 'rm -f "$CURL_CFG" "$PAYLOAD_FILE"' EXIT
 printf '%s' "$PAYLOAD" > "$PAYLOAD_FILE"
 
 # Make API call
@@ -97,11 +126,36 @@ RESPONSE=$(curl_with_retry -s -X POST "$ENDPOINT" \
     -H "Content-Type: application/json" \
     --data-binary @"$PAYLOAD_FILE")
 
-# Extract text from response
-TEXT=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // empty')
+# Extract text from response. Join every text part rather than assuming the
+# answer sits in parts[0] — a thought-signature part can precede it.
+TEXT=$(echo "$RESPONSE" | jq -r '[.candidates[0].content.parts[]? | select(.text) | .text] | join("") // empty')
 
-if [[ -z "$TEXT" ]]; then
-    ERROR=$(echo "$RESPONSE" | jq -r '.error.message // "Unknown error"')
+    # Whitespace-stripped, not just empty: a model that answers with a single
+    # space passes a bare -z test, and the council would store that as a
+    # successful answer and weigh it in the synthesis like any other.
+if [[ -z "${TEXT//[[:space:]]/}" ]]; then
+    # A well-formed HTTP error carries .error.message. A 200 with no visible
+    # text (most often the model spending its whole token budget on internal
+    # reasoning, or a safety block) carries neither .error nor .candidates —
+    # surface finishReason/blockReason/token usage instead of a bare
+    # "Unknown error" so the real cause is visible in logs.
+    # .error is an object here and a bare string for some upstreams, and
+    # ensure_error_body passes a >=400 body that already carries a usable
+    # message through untouched -- so the string shape reaches this jq as-is.
+    # Indexing a string raises rather than yielding null, and `//` does not
+    # catch a raise, so the read branches on the type first.
+    ERROR=$(echo "$RESPONSE" | jq -r '
+        (if (.error | type) == "object" then (.error.message // "")
+         elif (.error | type) == "string" then .error
+         else "" end | tostring) as $top
+        | if $top != "" then $top
+        elif (.promptFeedback.blockReason // "") != "" then
+            "prompt blocked (" + .promptFeedback.blockReason + ")"
+        elif (.candidates[0].finishReason // "") != "" then
+            "empty response (finishReason: " + .candidates[0].finishReason +
+            ", thoughts tokens: " + ((.usageMetadata.thoughtsTokenCount // 0) | tostring) +
+            "/" + ((.usageMetadata.totalTokenCount // 0) | tostring) + ")"
+        else "Unknown error" end')
     echo "Error from Gemini: $ERROR" >&2
     is_model_unavailable_error "$RESPONSE" && exit 3
     exit 1

@@ -20,9 +20,13 @@ PROMPT="${1:-}"
 IMAGE_FILE=""
 IMAGE_MIME=""
 # A large prompt (e.g. a big --file) arrives via a temp file to stay off
-# the process argv, where the OS would reject it as "argument list too long".
+# the process argv, where the OS would reject it as "argument list too long". The
+# path is kept, not just the text: jq reads the prompt with --rawfile, so it
+# stays off jq\'s argv too — bounded by the same limit.
+PROMPT_FILE=""
 if [[ "$PROMPT" == "--prompt-file" ]]; then
-    PROMPT=$(cat "${2:?--prompt-file requires a path}")
+    PROMPT_FILE="${2:?--prompt-file requires a path}"
+    PROMPT=""
     shift 2
 elif [[ $# -gt 0 ]]; then
     shift
@@ -35,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$PROMPT" ]]; then
+if [[ -z "$PROMPT" && ! -s "$PROMPT_FILE" ]]; then
     echo "Error: No prompt provided" >&2
     exit 1
 fi
@@ -70,6 +74,19 @@ bump_for_reasoning TOKENS "$MODEL" "$BASE_TOKENS" 'kimi-k*'
 # System instruction
 SYSTEM="${VERBOSITY_PREFIX:+$VERBOSITY_PREFIX }$BASE_SYSTEM_PROMPT"
 
+# One trap for every temp file this script owns, installed before the first of
+# them exists and naming them all: a failure between here and the request —
+# a jq that cannot read the image file, say — would otherwise leave the prompt
+# file behind, and an EXIT trap that expands a name not yet assigned ends where
+# it stands under set -u without removing anything.
+CURL_CFG="" PAYLOAD_FILE="" OWNED_PROMPT_FILE=""
+trap 'rm -f "$CURL_CFG" "$PAYLOAD_FILE" "$OWNED_PROMPT_FILE"' EXIT
+
+stage_prompt_file
+
+# The user-message content embeds the prompt, so it reaches the payload build
+# on stdin: printf is a builtin, so neither the argv limit nor a temp file is
+# involved, where --argjson would put the whole prompt back on argv.
 # The user message content is either a bare prompt string or, when an image is
 # supplied, an OpenAI-shaped [text, image_url] array. Kimi documents multimodal
 # content in the same shape, but provider_vision_capable deliberately leaves
@@ -77,21 +94,20 @@ SYSTEM="${VERBOSITY_PREFIX:+$VERBOSITY_PREFIX }$BASE_SYSTEM_PROMPT"
 # models, and that was never verified against the live API here. The branch is
 # kept so enabling vision is a one-line change in providers.sh once confirmed.
 if [[ -n "$IMAGE_FILE" ]]; then
-    USER_CONTENT=$(jq -n --arg prompt "$PROMPT" --rawfile b64 "$IMAGE_FILE" --arg mime "$IMAGE_MIME" '[
+    USER_CONTENT=$(jq -n --rawfile prompt "$PROMPT_FILE" --rawfile b64 "$IMAGE_FILE" --arg mime "$IMAGE_MIME" '[
         { type: "text",      text: $prompt },
         { type: "image_url", image_url: { url: ("data:" + $mime + ";base64," + $b64) } }
     ]')
 else
-    USER_CONTENT=$(jq -n --arg prompt "$PROMPT" '$prompt')
+    USER_CONTENT=$(jq -n --rawfile prompt "$PROMPT_FILE" '$prompt')
 fi
 
 # max_tokens is still accepted alongside the newer max_completion_tokens, and is
 # what every other provider here sends — keep the payload uniform.
-PAYLOAD=$(jq -n \
+PAYLOAD=$(printf '%s' "$USER_CONTENT" | jq \
     --arg model "$MODEL" \
     --argjson tokens "$TOKENS" \
     --arg system "$SYSTEM" \
-    --argjson content "$USER_CONTENT" \
     '{
         model: $model,
         messages: [{
@@ -99,7 +115,7 @@ PAYLOAD=$(jq -n \
             content: $system
         }, {
             role: "user",
-            content: $content
+            content: .
         }],
         # Moonshot rejects every value but 1 across its whole model line, with
         # "invalid temperature: only 1 is allowed for this model". The 0.7 the
@@ -121,7 +137,6 @@ fi
 # the payload via a temp file.
 CURL_CFG=$(curl_secret_config "Authorization: Bearer ${API_KEY}")
 PAYLOAD_FILE=$(mktemp)
-trap 'rm -f "$CURL_CFG" "$PAYLOAD_FILE"' EXIT
 printf '%s' "$PAYLOAD" > "$PAYLOAD_FILE"
 
 # Make API call
@@ -138,7 +153,10 @@ fi
 # Extract text from response (OpenAI-compatible format)
 TEXT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
 
-if [[ -z "$TEXT" ]]; then
+    # Whitespace-stripped, not just empty: a model that answers with a single
+    # space passes a bare -z test, and the council would store that as a
+    # successful answer and weigh it in the synthesis like any other.
+if [[ -z "${TEXT//[[:space:]]/}" ]]; then
     ERROR=$(echo "$RESPONSE" | jq -r '(if (.error | type) == "object" then (.error.message // "") elif (.error | type) == "string" then .error else "" end) | select(. != "") // "Unknown error"')
     echo "Error from Kimi: $ERROR" >&2
     is_model_unavailable_error "$RESPONSE" && exit 3

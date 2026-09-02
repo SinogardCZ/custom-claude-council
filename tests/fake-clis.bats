@@ -103,6 +103,22 @@ teardown() {
     [[ "$(echo "$call" | jq -r '.args | index("-s") as $i | .[$i+1]')" == "read-only" ]]
 }
 
+@test "codex.sh: a CLI that exits 0 on the deadline signal is a timeout, not an empty answer" {
+    export COUNCIL_FAKE_BEHAVIOR=hang-handled COUNCIL_FAKE_SLEEP=8 COUNCIL_TIMEOUT=1
+    local start end
+    start=$SECONDS
+    run --separate-stderr "${PROVIDERS_DIR_REAL}/codex.sh" "test prompt"
+    end=$SECONDS
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"timed out"* ]]
+    [ -z "$output" ]
+    # Without pgrep (Git Bash) the fake's own sleep outlives it and holds
+    # codex.sh's captured stdout; the verdict still holds, the bound does not.
+    if command -v pgrep >/dev/null 2>&1; then
+        [ $((end - start)) -lt 6 ]
+    fi
+}
+
 @test "codex.sh: a hung CLI is bounded by COUNCIL_TIMEOUT and reports a timeout" {
     export COUNCIL_FAKE_BEHAVIOR=hang COUNCIL_FAKE_SLEEP=30 COUNCIL_TIMEOUT=1
     local start end
@@ -111,10 +127,11 @@ teardown() {
     end=$SECONDS
     [ "$status" -eq 1 ]
     [[ "$stderr" == *"timed out"* ]]
-    # And nothing else: bash reports a signal-killed foreground child on its
-    # own stderr, which the council would store as the provider's error text.
-    [[ "$stderr" != *"Alarm clock"* ]]
-    [[ "$stderr" != *"exec @ARGV"* ]]
+    # And nothing else: bash reports a signal-killed job on its own stderr
+    # when it is waited for, which the council would store as the provider's
+    # error text.
+    [[ "$stderr" != *"Terminated"* ]]
+    [[ "$stderr" != *'0<&0'* ]]
     [ $((end - start)) -lt 10 ]
 }
 
@@ -189,10 +206,11 @@ teardown() {
     end=$SECONDS
     [ "$status" -eq 1 ]
     [[ "$stderr" == *"timed out"* ]]
-    # And nothing else: bash reports a signal-killed foreground child on its
-    # own stderr, which the council would store as the provider's error text.
-    [[ "$stderr" != *"Alarm clock"* ]]
-    [[ "$stderr" != *"exec @ARGV"* ]]
+    # And nothing else: bash reports a signal-killed job on its own stderr
+    # when it is waited for, which the council would store as the provider's
+    # error text.
+    [[ "$stderr" != *"Terminated"* ]]
+    [[ "$stderr" != *'0<&0'* ]]
     [ $((end - start)) -lt 10 ]
 }
 
@@ -270,10 +288,11 @@ teardown() {
     end=$SECONDS
     [ "$status" -eq 1 ]
     [[ "$stderr" == *"timed out"* ]]
-    # And nothing else: bash reports a signal-killed foreground child on its
-    # own stderr, which the council would store as the provider's error text.
-    [[ "$stderr" != *"Alarm clock"* ]]
-    [[ "$stderr" != *"exec @ARGV"* ]]
+    # And nothing else: bash reports a signal-killed job on its own stderr
+    # when it is waited for, which the council would store as the provider's
+    # error text.
+    [[ "$stderr" != *"Terminated"* ]]
+    [[ "$stderr" != *'0<&0'* ]]
     [ $((end - start)) -lt 10 ]
 }
 
@@ -407,12 +426,12 @@ teardown() {
     end=$SECONDS
     [ "$status" -eq 1 ]
     [[ "$stderr" == *"timed out"* ]]
-    # Only that. Bash reports a foreground child killed by a signal on its own
-    # stderr, and the council captures provider stderr verbatim as the error
-    # text, so the report would reach the pane carrying the absolute script
-    # path, a PID and the whole internal command line.
-    [[ "$stderr" != *"Alarm clock"* ]]
-    [[ "$stderr" != *"exec @ARGV"* ]]
+    # Only that. Bash reports a job killed by a signal on its own stderr when
+    # it is waited for, and the council captures provider stderr verbatim as
+    # the error text, so the report would reach the pane carrying the absolute
+    # script path, a PID and the whole internal command line.
+    [[ "$stderr" != *"Terminated"* ]]
+    [[ "$stderr" != *'0<&0'* ]]
     [ $((end - start)) -lt 10 ]
 }
 
