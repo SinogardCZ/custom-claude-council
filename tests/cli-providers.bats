@@ -76,6 +76,26 @@ source_lib_and_call() {
     [[ "$output" != *"perplexity"* ]]
 }
 
+@test "discover_providers: includes nvidia when NVIDIA_API_KEY is set" {
+    run bash -c "
+        set -euo pipefail
+        export PROVIDERS_DIR='${PROVIDERS_DIR_REAL}'
+        export NVIDIA_API_KEY='test-key'
+        source '${PROVIDERS_LIB}'
+        discover_providers
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"nvidia"* ]]
+}
+
+@test "discover_providers: excludes nvidia when NVIDIA_API_KEY is unset" {
+    # setup() unsets it; without this half the test above passes on any machine
+    # that exports the key for real, and proves nothing about the gate.
+    run source_lib_and_call 'discover_providers'
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"nvidia"* ]]
+}
+
 @test "discover_providers: includes openai when OPENAI_API_KEY is set" {
     export OPENAI_API_KEY="test-key"
     run bash -c "

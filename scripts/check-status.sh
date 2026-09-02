@@ -270,6 +270,16 @@ grok_status=$(check_provider "grok" "GROK_API_KEY" "$(get_model grok)")
 perplexity_status=$(check_provider "perplexity" "PERPLEXITY_API_KEY" "$(get_model perplexity)")
 kimi_status=$(check_provider "kimi" "KIMI_API_KEY" "$(get_model kimi)")
 openrouter_status=$(check_provider "openrouter" "OPENROUTER_API_KEY" "$(get_model openrouter)")
+# nvidia has no row, and deliberately so: neither shape of probe can tell the
+# truth about it inside the 10 s every probe here is bounded by. Measured against
+# a live key on 2026-09-02: GET https://integrate.api.nvidia.com/v1/models answers
+# 200 with no key at all and with a rejected one, so the openai-shaped probe would
+# report a dead seat as Connected — the same trap documented above for OpenRouter.
+# The other direction fails too: the catalog is a shared free tier, and a chat
+# request on a valid key sat in the queue past 12 s for both the default model and
+# the fast one, so a chat-shaped probe would report a working key as unreachable.
+# A row that can only be wrong is worse than no row; add one when NVIDIA ships an
+# endpoint that authenticates.
 # The measured round-trip, kept so a roster can stamp it onto every seat's row
 # without probing again. Empty unless the probe succeeded.
 openrouter_probe_ms=""

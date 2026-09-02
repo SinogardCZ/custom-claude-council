@@ -8,6 +8,30 @@ to a `YYYY.M.BUILD` versioning scheme where `BUILD` resets each month.
 
 ### Features
 
+- **An NVIDIA NIM seat.** `NVIDIA_API_KEY` enlists a provider that reaches
+  NVIDIA's API catalog over its OpenAI-compatible endpoint, defaulting to
+  `deepseek-ai/deepseek-v4-pro-0813` — a frontier coding model the council had no
+  voice for. Three things about it are not like the other seats. The date suffix
+  in the id is load-bearing: the bare name is a 404, which is what most reports
+  of a blocked NVIDIA account actually are. `temperature: 1` and `top_p: 0.95`
+  are what NVIDIA documents for the model and what its published benchmarks were
+  run at, so this seat does not send the 0.7 the others do. And the catalog's
+  free endpoints are a shared queue — a request can wait minutes for its first
+  byte and then deliver the whole answer at once — so `COUNCIL_TIMEOUT` needs
+  raising well above its default before the seat is usable.
+
+  The token cap is where it meets the change above: NIM documents `max_tokens`
+  as 1..16384 for this model, under `bump_for_reasoning`'s 32768 floor, so the
+  seat passes `--ceiling` and lands on 16384 instead of a 400.
+
+  `NVIDIA_REASONING_EFFORT` (`none|high|max`) is sent only when set, so pointing
+  `NVIDIA_MODEL` at a model that does not accept the field cannot turn every call
+  into a 400. There is no `/status` row: measured on 2026-09-02, NVIDIA's
+  `/v1/models` answers 200 with no key and with a rejected one, while a chat
+  request on a valid key outlives the 10 s every probe here is bounded by — so
+  both shapes of probe would report the wrong thing, and a row that can only be
+  wrong is worse than none.
+
 - **`bump_for_reasoning` takes an optional `--ceiling`.** The helper is written
   as a *raise*: it multiplies the base cap by eight and never returns less than
   32768. For an API whose own limit sits below that floor, the raise is a

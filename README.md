@@ -22,7 +22,7 @@ on.
 
 # 2. Configure at least one provider — any of these works:
 export OPENAI_API_KEY="..."         # or GEMINI_API_KEY, XAI_API_KEY, PERPLEXITY_API_KEY, KIMI_API_KEY,
-                                    # OPENROUTER_API_KEY
+                                    # OPENROUTER_API_KEY, NVIDIA_API_KEY
                                     # OR install the codex / antigravity (agy) / grok / kimi CLIs (uses your
                                     # existing subscription — no API key needed)
 
@@ -462,7 +462,16 @@ export PERPLEXITY_API_KEY="your-key"
 export KIMI_API_KEY="your-key"         # MOONSHOT_API_KEY is read as a fallback,
                                        # but only KIMI_API_KEY makes kimi discoverable
 export OPENROUTER_API_KEY="your-key"   # one key, any model on openrouter.ai/models
+export NVIDIA_API_KEY="your-key"       # nvapi- key from build.nvidia.com
 ```
+
+`nvidia` seats a model from NVIDIA's API catalog, defaulting to
+`deepseek-ai/deepseek-v4-pro-0813`. The date suffix is part of the id — the bare
+name is a 404. The catalog's free endpoints are a shared queue: a request can sit
+for minutes before the first byte and then deliver the whole answer at once, so
+raise `COUNCIL_TIMEOUT` well above its 300 s default before seating it.
+`NVIDIA_REASONING_EFFORT` accepts `none|high|max` and is sent only when set;
+unset, the server's own default (`none`) applies.
 
 `openrouter` seats whatever model `OPENROUTER_MODEL` names, defaulting to
 `anthropic/claude-sonnet-5` — the one vendor the council has no direct seat for.

@@ -28,6 +28,7 @@ Each provider is a shell script in `scripts/providers/` that:
 | Grok | `XAI_API_KEY` (or `GROK_API_KEY`) | grok-latest |
 | Perplexity | `PERPLEXITY_API_KEY` | sonar-reasoning-pro |
 | Kimi | `KIMI_API_KEY` | kimi-k3 |
+| NVIDIA NIM | `NVIDIA_API_KEY` | deepseek-ai/deepseek-v4-pro-0813 |
 | Ollama | none (local) | first model `ollama list` shows |
 | OpenRouter | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-5 (or one seat per `OPENROUTER_MODELS` entry) |
 

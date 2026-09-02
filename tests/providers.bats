@@ -147,6 +147,13 @@ run_provider_with_prompt_file() {
     ! grep -qF "$PROMPT_LEAK_MARK" "$JQ_ARGV_FILE"
 }
 
+@test "nvidia: a large prompt never reaches jq's argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"NV_OK"}}]}'
+    run_provider_with_prompt_file nvidia.sh NVIDIA_API_KEY=k
+    [ "$status" -eq 0 ]
+    ! grep -qF "$PROMPT_LEAK_MARK" "$JQ_ARGV_FILE"
+}
+
 @test "ollama: a large prompt never reaches jq's argv" {
     # ollama gates on its binary rather than a key, and OLLAMA_MODEL skips the
     # `ollama list` lookup, so a bare stub on PATH is enough to reach the payload.
@@ -178,6 +185,7 @@ run_provider_with_prompt_file() {
                 "grok.sh:GROK_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}" \
                 "perplexity.sh:PERPLEXITY_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}" \
                 "kimi.sh:KIMI_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}" \
+                "nvidia.sh:NVIDIA_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}" \
                 "openrouter.sh:OPENROUTER_API_KEY:{\"choices\":[{\"message\":{\"content\":\"   \"}}]}"; do
         local script="${spec%%:*}" rest="${spec#*:}"
         local keyvar="${rest%%:*}" body="${rest#*:}"
@@ -675,6 +683,95 @@ run_provider_with_image() {
 
     FAKE_BODY='{"error":{"message":"invalid api key"}}'
     FAKE_HTTP=401 run_provider kimi.sh "hi" KIMI_API_KEY=k
+    [ "$status" -eq 1 ]
+}
+
+# ---- nvidia (NVIDIA NIM) ----
+
+@test "nvidia: extracts content and surfaces errors" {
+    FAKE_BODY='{"choices":[{"message":{"content":"NVIDIA_OK"}}]}'
+    run_provider nvidia.sh "hi" NVIDIA_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$output" = "NVIDIA_OK" ]
+}
+
+@test "nvidia: missing key fails before any request" {
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider nvidia.sh "hi"
+    [ "$status" -eq 1 ]
+    [[ "$stderr" == *"NVIDIA_API_KEY not set"* ]]
+    assert_blank "$(cat "$ARGV_FILE")"
+}
+
+@test "nvidia: routes to the NVIDIA API Catalog chat-completions endpoint" {
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider nvidia.sh "hi" NVIDIA_API_KEY=k
+    [ "$status" -eq 0 ]
+    grep -qF "https://integrate.api.nvidia.com/v1/chat/completions" "$ARGV_FILE"
+}
+
+@test "nvidia: the default model carries its date suffix, and the bump stops at the API's cap" {
+    # The suffix is load-bearing: bare deepseek-ai/deepseek-v4-pro is a 404, and
+    # most of the "my NVIDIA account is blocked" reports are this instead.
+    # The cap is asserted on the same run because the two are one fact here: NIM
+    # documents max_tokens as 1..16384 for this model, and bump_for_reasoning's
+    # floor is 32768 — without --ceiling every call would be a 400.
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider nvidia.sh "hi" NVIDIA_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.model' "$DATA_FILE")" = "deepseek-ai/deepseek-v4-pro-0813" ]
+    [ "$(jq -r '.max_tokens' "$DATA_FILE")" = "16384" ]
+}
+
+@test "nvidia: sends NVIDIA's documented sampling settings, not the council's 0.7" {
+    # temperature 1 / top_p 0.95 are what NVIDIA documents for this model and
+    # what its published benchmarks were run at. The divergence is deliberate.
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider nvidia.sh "hi" NVIDIA_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.temperature' "$DATA_FILE")" = "1" ]
+    [ "$(jq -r '.top_p' "$DATA_FILE")" = "0.95" ]
+}
+
+@test "nvidia: no reasoning_effort is sent unless NVIDIA_REASONING_EFFORT is set" {
+    # The server default is none. Sending the field unasked would turn every
+    # call into a 400 the moment NVIDIA_MODEL points at a model without it.
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider nvidia.sh "hi" NVIDIA_API_KEY=k
+    [ "$status" -eq 0 ]
+    [ "$(jq -r 'has("reasoning_effort")' "$DATA_FILE")" = "false" ]
+}
+
+@test "nvidia: NVIDIA_REASONING_EFFORT reaches the payload when set" {
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider nvidia.sh "hi" NVIDIA_API_KEY=k NVIDIA_REASONING_EFFORT=high
+    [ "$status" -eq 0 ]
+    [ "$(jq -r '.reasoning_effort' "$DATA_FILE")" = "high" ]
+}
+
+@test "nvidia: bearer key never appears in the process argv" {
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider nvidia.sh "hi" NVIDIA_API_KEY=SEKRET_NVIDIA
+    [ "$status" -eq 0 ]
+    run ! grep -qF "SEKRET_NVIDIA" "$ARGV_FILE"
+    grep -qF "SEKRET_NVIDIA" "$CONFIG_FILE"
+}
+
+@test "nvidia: request payload is sent off-argv via a file" {
+    FAKE_BODY='{"choices":[{"message":{"content":"x"}}]}'
+    run_provider nvidia.sh "UNIQUE_NVIDIA_MARKER_77" NVIDIA_API_KEY=k
+    [ "$status" -eq 0 ]
+    run ! grep -qF "UNIQUE_NVIDIA_MARKER_77" "$ARGV_FILE"
+    grep -qF "UNIQUE_NVIDIA_MARKER_77" "$DATA_FILE"
+}
+
+@test "nvidia: an unavailable model exits 3, an ordinary error exits 1" {
+    FAKE_BODY='{"error":{"message":"model not found","type":"invalid_request_error"}}'
+    FAKE_HTTP=404 run_provider nvidia.sh "hi" NVIDIA_API_KEY=k
+    [ "$status" -eq 3 ]
+
+    FAKE_BODY='{"error":{"message":"invalid api key"}}'
+    FAKE_HTTP=401 run_provider nvidia.sh "hi" NVIDIA_API_KEY=k
     [ "$status" -eq 1 ]
 }
 

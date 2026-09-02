@@ -66,7 +66,7 @@ command_exists() {
 # Helper: clear every provider API key so discovery sees none of them
 unset_provider_keys() {
     unset GEMINI_API_KEY OPENAI_API_KEY GROK_API_KEY XAI_API_KEY PERPLEXITY_API_KEY
-    unset KIMI_API_KEY MOONSHOT_API_KEY OPENROUTER_API_KEY
+    unset KIMI_API_KEY MOONSHOT_API_KEY OPENROUTER_API_KEY NVIDIA_API_KEY
 }
 
 # Helper: block until any of the given files exists. Gives up after ~8s so a
