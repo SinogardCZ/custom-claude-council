@@ -1,0 +1,9 @@
+{
+  "name": "sinogard-council",
+  "owner": { "name": "SinogardCZ" },
+  "description": "Fork of hex/claude-council carrying changes that are open upstream as PRs; tracks upstream main.",
+  "plugins": [
+    { "name": "claude-council", "source": "./",
+      "description": "hex/claude-council + NVIDIA NIM provider (DeepSeek V4 Pro) + bump_for_reasoning --ceiling" }
+  ]
+}
